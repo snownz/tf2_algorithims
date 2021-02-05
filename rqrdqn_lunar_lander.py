@@ -23,11 +23,11 @@ args.normalize_obs = False
 args.noise  = 'normal'
 args.gamma = 0.99
 args.tau = 5e-3
-args.batch_size = 32
+args.batch_size = 512
 args.epochs = None
 args.epoch_cycles = 20
 args.rollout_steps = 1000
-args.sequence = 32
+args.sequence = 16
 args.buffer_size = 30000
 args.num_steps = 2000000
 
@@ -55,8 +55,8 @@ args.action_dim = env.action_space.n
 args.state_dim = env.observation_space.shape[0]
 
 dqn = RecurrentQRDqnAgent( args.state_dim, args.action_dim, args.buffer_size, args.batch_size, 
-                           args.sequence, args.experiment, 256, 128, 128, 8, args.sequence, 'g',
-                           priorized_exp = False, reduce = 'sum_half', train = args.train )
+                           args.sequence, args.experiment, 256, 128, 16, 8, args.sequence, 'g',
+                           priorized_exp = False, reduce = 'mean_half', train = args.train )
 
 base_dir = os.getcwd() + '/models/' + args.environment + '_' + args.experiment + '/'
 run_number = 0
@@ -96,6 +96,7 @@ states_ = list( np.zeros( [ args.sequence, args.state_dim ] ) )
 rewards = list( np.zeros( [ args.sequence ] ) )
 actions = list( np.zeros( [ args.sequence ] ) )
 dones = list( np.zeros( [ args.sequence ] ) )
+prevs = p_state
 
 bar = trange(nb_epochs)
 for epoch in bar:
@@ -106,7 +107,7 @@ for epoch in bar:
             Get an action from neural network and run it in the environment
             """           
             action, p_state = dqn.act( tf.convert_to_tensor( [[state]], dtype=tf.float32 ), 
-                                        p_state, total_steps, args.train )
+                                        prevs, total_steps, args.train )
             
             # remove the batch_size dimension if batch_size == 1
             next_state, reward, is_terminal, _ = env.step(action)
@@ -126,8 +127,8 @@ for epoch in bar:
             dones.append( is_terminal )
 
             count_down -= 1
-            if args.train and ( count_down <= 0 or is_terminal ):
-                dqn.step( np.array( states ), np.array( actions ), np.array( rewards ), np.array( states_ ), np.array( dones ) )
+            # if args.train and ( count_down <= 0 or is_terminal ):
+            dqn.step( np.array( states ), np.array( actions ), np.array( rewards ), np.array( states_ ), np.array( dones ), prevs.numpy()[0] )
             
             episode_rewards += reward
             # p_state = dqn.reset(1)
@@ -136,12 +137,13 @@ for epoch in bar:
             # episode_rewards
             if is_terminal:
 
-                p_state = dqn.reset(1)
+                p_state = dqn.reset(1)                
                 states = list( np.zeros( [ args.sequence, args.state_dim ] ) )
                 states_ = list( np.zeros( [ args.sequence, args.state_dim ] ) )
                 rewards = list( np.zeros( [ args.sequence ] ) )
                 actions = list( np.zeros( [ args.sequence ] ) )
                 dones = list( np.zeros( [ args.sequence ] ) )
+
                 count_down = 64
                 
                 state = np.float32(env.reset())                
@@ -155,6 +157,8 @@ for epoch in bar:
 
             if not args.train:
                 env.render()
+
+            prevs = p_state
 
             total_steps += 1
 

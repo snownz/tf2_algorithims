@@ -757,7 +757,8 @@ class RecurrentNALUQRNetwork(tf.Module):
         self.action_dim = action_dim
         self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
                                 
-        self.fc1 = nalu( f1, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1s = nalu( f1, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1h = nalu( f1, kernel_initializer = tf.keras.initializers.random_normal() )
         self.fc2 = nalu( f2, kernel_initializer = tf.keras.initializers.random_normal() )
         self.fc3 = nalu( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
 
@@ -841,12 +842,16 @@ class RecurrentNALUQRNetwork(tf.Module):
 
         xt, *h = self.rnn( states, initial_state = p_state, training = self.log )
         
-        xt = tf.nn.elu( self.fc1( xt ) )
-        if self.log: xt = self.dp1( xt )
-        xt = tf.nn.elu( self.fc2( xt ) )
-        if self.log: xt = self.dp2( xt )
+        xh = self.fc1h( xt )
+        xs = tf.nn.elu( self.fc1s( states ) )
         
-        pred = self.fc3( tf.concat( [ xt, states ], axis = -1 ) )
+        x = xh + xs
+        if self.log: x = self.dp1( x )
+        
+        x = tf.nn.elu( self.fc2( x ) )
+        if self.log: x = self.dp2( x )        
+        
+        pred = self.fc3( x )
 
         return tf.reshape( pred, [ bs, ss, self.action_dim, self.atoms ] ), h
     
@@ -857,8 +862,8 @@ class RecurrentNALUQRNetwork(tf.Module):
         
         target_tile = tf.cast( tf.tile( tf.expand_dims( target, axis = 2 ), [ 1, 1, self.atoms, 1 ] ), tf.float32 )
         
-        huber_loss = tf.math.square( pred_tile - target_tile )
-        # huber_loss = tf.compat.v1.losses.huber_loss( target_tile, pred_tile, reduction = tf.keras.losses.Reduction.NONE )
+        # huber_loss = tf.math.square( pred_tile - target_tile )
+        huber_loss = tf.compat.v1.losses.huber_loss( target_tile, pred_tile, reduction = tf.keras.losses.Reduction.NONE )
         
         tau = tf.cast( tf.reshape( np.array( self.tau ), [ 1, self.atoms ] ), tf.float32 )
         inv_tau = tf.cast( 1.0 - tau, tf.float32 )
@@ -934,32 +939,24 @@ class RecurrentNALUQRNetwork(tf.Module):
 
         return huber_loss, tf.reduce_mean( theta, axis = -1 )
 
-    def train_all_states(self, states, target, actions, dones, we, step, bs):
+    def train_all_states(self, states, target, actions, dones, prev, we, step, bs):
 
         bs, *_ = shape_list( states )
 
         with tf.GradientTape() as tape:
 
-            theta, _ = self( states, None )
+            theta, _ = self( states, prev )
             
-            huber_loss = self.quantile_huber_loss( target, theta, actions ) * we         
+            huber_loss = self.quantile_huber_loss( target, theta, actions )
             loss = self.reduce( huber_loss )
 
-            l2_loss = ( 
-                  tf.nn.l2_loss( self.fc1.weights[0] )
-                + tf.nn.l2_loss( self.fc1.weights[1] )
-                + tf.nn.l2_loss( self.fc2.weights[0] )
-                + tf.nn.l2_loss( self.fc2.weights[1] )
-                + tf.nn.l2_loss( self.fc3.weights[0] )
-                + tf.nn.l2_loss( self.fc3.weights[1] )
-            )
-            t_loss = loss # + ( 2e-4 * l2_loss )
+            t_loss = loss
             
         gradients = tape.gradient( t_loss, self.trainable_variables )
         self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
 
         self.train_loss( loss )
-        self.train_l2_loss( 2e-4 * l2_loss )
+        self.train_l2_loss( 0 )
 
         return huber_loss, tf.reduce_mean( theta, axis = -1 )
 
