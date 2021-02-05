@@ -8,6 +8,9 @@ import random, math
 import numpy as np
 from utils import save_model, load_model, save_checkpoint, restore_checkpoint
 
+'''
+Simple Deep Q-Learning
+'''
 class DqnAgent():
 
     def __init__(self, state_size, action_size, 
@@ -112,6 +115,9 @@ class DqnAgent():
         restore_checkpoint( self.qnetwork_target, directory + 'target' )
 
 
+'''
+Distributional RL C51 - Q
+'''
 class C51DqnAgent():
 
     def __init__(self, state_size, action_size, 
@@ -236,6 +242,9 @@ class C51DqnAgent():
         restore_checkpoint( self.qnetwork_target, directory + 'target' )
 
 
+'''
+Distributional Quantile Regression
+'''
 class QRDqnAgent():
 
     def __init__(self, state_size, action_size, 
@@ -345,6 +354,9 @@ class QRDqnAgent():
         restore_checkpoint( self.qnetwork_target, directory + 'target' )
 
 
+'''
+Distributional Quantile Regression with NALU
+'''
 class NQRDqnAgent():
 
     def __init__(self, state_size, action_size,
@@ -467,6 +479,10 @@ class NQRDqnAgent():
         restore_checkpoint( self.qnetwork_target, directory + 'target' )
 
 
+'''
+Distributional Quantile Regression with NALU
+-- Agnostic input and output
+'''
 class AGNNQRDqnAgent():
 
     def __init__(self, state_size, action_size,
@@ -590,6 +606,9 @@ class AGNNQRDqnAgent():
         restore_checkpoint( self.qnetwork_target, directory + 'target' )
 
 
+'''
+Distributional Recurrent Quantile Regression
+'''
 class RecurrentQRDqnAgent():
 
     def __init__(self, state_size, action_size,
@@ -625,9 +644,9 @@ class RecurrentQRDqnAgent():
         # Initialize time step (for updating every UPDATE_EVERY steps)
         self.t_step = 0
     
-    def step(self, state, action, reward, next_state, done):
+    def step(self, state, action, reward, next_state, done, prev):
         # Save experience in replay memory
-        self.memory.store( state, action, reward, next_state, done )
+        self.memory.store( state, action, reward, next_state, done, prev )
     
     def reset(self, bs):
         return self.qnetwork_local.zero_states(bs)
@@ -661,6 +680,7 @@ class RecurrentQRDqnAgent():
         reward_batch = tf.cast( transitions.r, tf.float32 )
         next_state_batch = transitions.sp
         terminal_mask = tf.cast( transitions.it, tf.float32 )
+        prevs = transitions.pr
 
         q, _ = self.qnetwork_target( next_state_batch, None )
         next_actions = np.argmax( np.mean( q, axis = 3 ), axis = 2 )
@@ -672,10 +692,9 @@ class RecurrentQRDqnAgent():
                     ( ( 1 - terminal_mask )[:,:,tf.newaxis] * ( reward_batch[:,:,tf.newaxis] + self.gamma * q_selected ) ) 
                 )
                 
-        td_error, th = self.qnetwork_local.train( state_batch, theta, action_batch, terminal_mask, 
+        td_error, th = self.qnetwork_local.train( state_batch, theta, action_batch, terminal_mask, prevs, 
                                                   w, self.t_step, self.batch_size )
         
-        self.qnetwork_local.ereward(tf.reduce_mean(reward_batch[:,-1]))
         self.qnetwork_local.treward(tf.reduce_mean(reward_batch))
 
         # ------------------- update target network ------------------- #
@@ -694,7 +713,8 @@ class RecurrentQRDqnAgent():
             tf.summary.histogram( 'theta out', th, step = self.t_step )
             tf.summary.histogram( 'theta target', tf.reduce_mean( theta, axis = -1 ), step = self.t_step )
 
-            tf.summary.histogram( 'l1', self.qnetwork_local.fc1.weights[0], step = self.t_step )
+            tf.summary.histogram( 'l1h', self.qnetwork_local.fc1h.weights[0], step = self.t_step )
+            tf.summary.histogram( 'l1s', self.qnetwork_local.fc1s.weights[0], step = self.t_step )
             tf.summary.histogram( 'l2', self.qnetwork_local.fc2.weights[0], step = self.t_step )
             tf.summary.histogram( 'l3', self.qnetwork_local.fc3.weights[0], step = self.t_step )
 
@@ -711,6 +731,9 @@ class RecurrentQRDqnAgent():
         restore_checkpoint( self.qnetwork_target, directory + 'target' )
 
 
+'''
+Distributional Intrinsic Quantile Regression
+'''
 class IQDqnAgent():
 
     def __init__(self, state_size, action_size, 
@@ -819,6 +842,9 @@ class IQDqnAgent():
         restore_checkpoint( self.qnetwork_target, directory + 'target' )
 
 
+'''
+Simple Deep Q-Learning with Attention
+'''
 class DqnAttentionAgent():
 
     def __init__(self, state_size, action_size, 
@@ -932,6 +958,9 @@ class DqnAttentionAgent():
         restore_checkpoint( self.qnetwork_target, directory + 'target' )
 
 
+'''
+Simple Deep Q-Learning with conv2d
+'''
 class DqnAgentVision():
 
     def __init__(self, state_size, action_size, 
@@ -1005,6 +1034,9 @@ class DqnAgentVision():
         self.t_step += 1
 
 
+'''
+Simple Deep Q-Learning with VAE
+'''
 class DqnAgentVisionVae():
 
     def __init__(self, state_size, action_size, 
@@ -1092,6 +1124,9 @@ class DqnAgentVisionVae():
                 tf.summary.image( 'rec_{}'.format(i), d, step = self.t_step, max_outputs = 1 )
 
 
+'''
+Simple Deep Q-Learning with VQ VAE
+'''
 class DqnAgentVisionVQVae():
 
     def __init__(self, state_size, action_size,

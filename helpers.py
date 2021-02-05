@@ -114,6 +114,7 @@ class ReplayDiscreteSequenceBuffer(object):
         self.acts_buf = np.zeros([size, seq_dim, ], dtype=np.float32)
         self.rews_buf = np.zeros([size, seq_dim, ], dtype=np.float32)
         self.done_buf = np.zeros([size, seq_dim, ], dtype=np.float32)
+        self.prev_buf = np.zeros([size, 16 ], dtype=np.float32)
         self.ptr, self.size, self.max_size = 0, 0, size
         self.size_list = range(self.size)
 
@@ -128,12 +129,13 @@ class ReplayDiscreteSequenceBuffer(object):
             R.append( Return / ( ( idx - init ) + 1 ) )
         return np.array( ( init * [ 0 ] ) + R )
 
-    def store(self, obs, act, rew, next_obs, done):
+    def store(self, obs, act, rew, next_obs, done, prev):
         self.obs1_buf[self.ptr] = obs
         self.obs2_buf[self.ptr] = next_obs
         self.acts_buf[self.ptr] = act
-        self.rews_buf[self.ptr] = rew # 0.5 * rew + 0.5 * self.calc_multistep_return( rew )
+        self.rews_buf[self.ptr] = rew + 0.1 * self.calc_multistep_return( rew ) # 0.5 * rew + 0.5 * self.calc_multistep_return( rew )
         self.done_buf[self.ptr] = done
+        self.prev_buf[self.ptr] = prev
         self.ptr = (self.ptr+1) % self.max_size
         prev_size = self.size
         self.size = min(self.size+1, self.max_size)
@@ -147,6 +149,7 @@ class ReplayDiscreteSequenceBuffer(object):
         self.transitions.r = tf.convert_to_tensor(self.rews_buf[idxs])
         self.transitions.sp = tf.convert_to_tensor(self.obs2_buf[idxs])
         self.transitions.it = tf.convert_to_tensor(self.done_buf[idxs])
+        self.transitions.pr = tf.convert_to_tensor(self.prev_buf[idxs])
         return self.transitions
 
     def __len__(self):

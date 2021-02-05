@@ -58,7 +58,7 @@ class dense(Layer):
 
 class nalu(Layer):
 
-    def __init__(self, num_outputs, kernel_initializer, initializer=tf.keras.initializers.Orthogonal(), bias=True):
+    def __init__(self, num_outputs, kernel_initializer, initializer=tf.keras.initializers.truncated_normal(), bias=True):
         
         super(nalu, self).__init__()
         self.num_outputs = num_outputs
@@ -96,13 +96,11 @@ class nalu(Layer):
 
 class simple_nac(Layer):
 
-    def __init__(self, num_outputs, kernel_initializer, initializer=tf.keras.initializers.Orthogonal()):
+    def __init__(self, num_outputs, initializer=tf.keras.initializers.truncated_normal()):
         
         super(simple_nac, self).__init__()
         self.num_outputs = num_outputs
-        self.use_bias = bias
         self.initializer = initializer
-        self.kernel_initializer = kernel_initializer
     
     def build(self, input_shape):
 
@@ -113,28 +111,38 @@ class simple_nac(Layer):
 
         w = tf.multiply( tf.tanh( self.wt ), tf.sigmoid( self.mt ) )
         a = tf.matmul( input, w )
-        arithimetic_x = a
 
-        return arithimetic_x
+        return a
 
 class nalu_gru_cell(Layer):
 
-    def __init__(self, num_outputs, kernel_initializer, initializer=tf.keras.initializers.Orthogonal(), bias=True):
+    def __init__(self, num_outputs, kernel_initializer, bias=True):
+        
         super(nalu_gru_cell, self).__init__()
+        
         self.state_size = num_outputs
-        self.initializer = initializer
         self.kernel_initializer = kernel_initializer
         self.use_bias = bias
 
-        self.z_op = simple_nac( num_outputs, kernel_initializer, initializer )
-        self.r_op = simple_nac( num_outputs, kernel_initializer, initializer )
-        self.h_op = simple_nac( num_outputs, kernel_initializer, initializer )
+        self.z_oph = dense( num_outputs, kernel_initializer )
+        self.z_opi = dense( num_outputs, kernel_initializer )
+
+        self.r_oph = dense( num_outputs, kernel_initializer )
+        self.r_opi = dense( num_outputs, kernel_initializer )
+
+        self.h_oph = simple_nac( num_outputs )
+        self.h_opi = simple_nac( num_outputs )
     
     def build(self, input_shape):
 
-        self.z_op.build( input_shape )
-        self.r_op.build( input_shape )
-        self.h_op.build( input_shape )
+        self.z_oph.build( input_shape )
+        self.z_opi.build( input_shape )
+
+        self.r_oph.build( input_shape )
+        self.r_opi.build( input_shape )
+
+        self.h_oph.build( input_shape )
+        self.h_opi.build( input_shape )
 
         if self.use_bias:
             self.biasz = self.add_weight( 'biasz', shape = [ self.state_size ], initializer = tf.keras.initializers.Zeros() )
@@ -145,16 +153,19 @@ class nalu_gru_cell(Layer):
         
         states = states[0]
 
-        z = tf.nn.sigmoid( self.z_op( tf.concat( [ states, input ], axis = -1 ) ) )
+        z = self.z_oph( states ) + self.z_opi( input )
         if self.use_bias: z = z + self.biasz
+        z = tf.nn.sigmoid( z )
 
-        r = tf.nn.sigmoid( self.r_op( tf.concat( [ states, input ], axis = -1 ) ) )
+        r = self.r_oph( states ) + self.r_opi( input )
         if self.use_bias: z = z + self.biasr
+        r = tf.nn.sigmoid( r )
 
-        h_ = tf.nn.tanh( self.h_op( tf.concat( [ r * states, input ], axis = -1 ) ) )
+        h_ = self.h_oph( r * states ) +  self.h_opi( input )
         if self.use_bias: h_ = h_ + self.biash
+        h_ = tf.nn.elu( h_ )
 
-        h = ( 1 - z ) * states + z * h_
+        h = ( ( 1 - z ) * states ) + ( z * h_ )
 
         return h, h
 
