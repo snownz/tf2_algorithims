@@ -3,6 +3,7 @@ import gym
 import numpy as np
 import tensorflow as tf
 from tqdm import trange
+import time
 
 from dqn_agent import RecurrentQRDqnAgent
 
@@ -23,12 +24,12 @@ args.normalize_obs = False
 args.noise  = 'normal'
 args.gamma = 0.99
 args.tau = 5e-3
-args.batch_size = 512
+args.batch_size = 1024
 args.epochs = None
-args.epoch_cycles = 20
+args.epoch_cycles = 2000
 args.rollout_steps = 1000
 args.sequence = 16
-args.buffer_size = 30000
+args.buffer_size = 15000
 args.num_steps = 2000000
 
 # args.experiment = 'rqrdqn_simple_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_endseq'
@@ -56,7 +57,7 @@ args.state_dim = env.observation_space.shape[0]
 
 dqn = RecurrentQRDqnAgent( args.state_dim, args.action_dim, args.buffer_size, args.batch_size, 
                            args.sequence, args.experiment, 256, 128, 16, 8, args.sequence, 'g',
-                           priorized_exp = False, reduce = 'mean_half', train = args.train )
+                           priorized_exp = False, reduce = 'sum_half', train = args.train )
 
 base_dir = os.getcwd() + '/models/' + args.environment + '_' + args.experiment + '/'
 run_number = 0
@@ -67,13 +68,6 @@ if args.load: dqn.restore_training( base_dir + 'training/' )
 os.makedirs( base_dir + str(run_number) )
 
 state = env.reset()
-results_dict = {
-    'train_rewards': [],
-    'eval_rewards': [],
-    'actor_losses': [],
-    'value_losses': [],
-    'critic_losses': []
-}
 episode_steps, episode_rewards = 0, 0 # total steps and rewards for each episode
 
 num_steps = args.num_steps
@@ -127,8 +121,8 @@ for epoch in bar:
             dones.append( is_terminal )
 
             count_down -= 1
-            # if args.train and ( count_down <= 0 or is_terminal ):
-            dqn.step( np.array( states ), np.array( actions ), np.array( rewards ), np.array( states_ ), np.array( dones ), prevs.numpy()[0] )
+            if args.train and ( count_down <= 0 or is_terminal ):
+                dqn.step( np.array( states ), np.array( actions ), np.array( rewards ), np.array( states_ ), np.array( dones ), prevs.numpy()[0] )
             
             episode_rewards += reward
             # p_state = dqn.reset(1)
@@ -149,7 +143,7 @@ for epoch in bar:
                 state = np.float32(env.reset())                
                 episode_steps = 0
                 episode_rewards = 0
-            
+
             else:
 
                 state = next_state
@@ -160,13 +154,20 @@ for epoch in bar:
 
             prevs = p_state
 
+            if len(dqn.memory) >= args.batch_size * 4 and args.train:
+                dqn.learn()
+                train_steps += 1
+
             total_steps += 1
 
             bar.set_description('Steps: {} - TSteps: {} - Buffer: {}'.format( total_steps, train_steps, len(dqn.memory) ) )
             bar.refresh() # to show immediately the update
 
-            if len(dqn.memory) >= args.batch_size * 4 and args.train:
-                dqn.learn()
-                train_steps += 1
-
-        dqn.save_training( base_dir + 'training/' )
+        # if len(dqn.memory) >= args.batch_size * 4 and args.train:
+            
+        #     for _ in range( args.rollout_steps // 2 ):
+        #         dqn.learn()
+        #         train_steps += 1
+            
+        #     if train_steps % 10000 == 0:
+        #         dqn.save_training( base_dir + 'training/' )

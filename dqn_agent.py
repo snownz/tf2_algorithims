@@ -1,8 +1,8 @@
 import tensorflow as tf
 from tensorboard.plugins.mesh import summary as mesh_summary
-from helpers import ReplayDiscreteBuffer, update, ActionSampler, normalize, denormalize, PrioritizedReplay, PrioritizedReplayExtra, ReplayDiscreteSequenceBuffer
+from helpers import ReplayDiscreteBuffer, update, normalize, denormalize, PrioritizedReplay, PrioritizedReplayExtra, ReplayDiscreteSequenceBuffer, ReplayDiscreteSTransformerBuffer
 from custom_rl import QNetwork, QNetworkVision, Vae, VQVae, QAttnNetwork, VQ, QRNetwork, IQNetwork, C51Network, RecurrentQRNetwork, NALUQRNetwork, AGNNALUQRNetwork, AGNNALUQRNetwork2
-from custom_rl import RecurrentNALUQRNetwork
+from custom_rl import RecurrentNALUQRNetwork, TransformerNALUQRNetwork
 from ann_utils import gather
 import random, math
 import numpy as np
@@ -362,7 +362,7 @@ class NQRDqnAgent():
     def __init__(self, state_size, action_size,
                  buffer_size, batch_size, name,
                  f1, f2, atoms, train,
-                 gamma=0.99, tau=1e-3, priorized_exp=False, gn=False):
+                 gamma=0.99, tau=1e-3, priorized_exp=False):
         
         self.state_size = state_size
         self.action_size = action_size
@@ -372,7 +372,6 @@ class NQRDqnAgent():
         self.gamma = gamma
         self.tau = tau
         self.priorized_exp = priorized_exp
-        self.gn = gn
 
         # Q-Network
         self.qnetwork_local = NALUQRNetwork( state_size, action_size, '{}_local'.format( name ), f1, f2, atoms, train = True, log = train )
@@ -717,6 +716,129 @@ class RecurrentQRDqnAgent():
             tf.summary.histogram( 'l1s', self.qnetwork_local.fc1s.weights[0], step = self.t_step )
             tf.summary.histogram( 'l2', self.qnetwork_local.fc2.weights[0], step = self.t_step )
             tf.summary.histogram( 'l3', self.qnetwork_local.fc3.weights[0], step = self.t_step )
+
+        self.t_step += 1
+
+    def save_training(self, directory):
+
+        save_checkpoint( self.qnetwork_local, directory + 'local', self.t_step )
+        save_checkpoint( self.qnetwork_target, directory + 'target', self.t_step )
+
+    def restore_training(self, directory):
+
+        self.t_step = restore_checkpoint( self.qnetwork_local, directory + 'local' )
+        restore_checkpoint( self.qnetwork_target, directory + 'target' )
+
+
+'''
+Distributional Transformer Quantile Regression
+'''
+class TransformerQRDqnAgent():
+
+    def __init__(self, state_size, action_size,
+                 buffer_size, batch_size, sequence_size, name,
+                 f1, f2, atoms, max_len,
+                 gamma=0.99, tau=1e-3, priorized_exp=False, reduce='sum', train=False):
+        
+        self.state_size = state_size
+        self.action_size = action_size
+        self.batch_size = batch_size
+        self.atoms = atoms
+        self.max_len = max_len
+
+        self.gamma = gamma
+        self.tau = tau
+        self.priorized_exp = priorized_exp
+
+        # Q-Network
+        self.qnetwork_local = TransformerNALUQRNetwork( state_size, action_size, '{}_local'.format( name ), 
+                                                        f1, f2, atoms, sequence_size, max_len, train = True, log = train, reduce = reduce )
+        self.qnetwork_target = TransformerNALUQRNetwork( state_size, action_size, '{}_target'.format( name ), f1, f2,  atoms, sequence_size, max_len )
+
+        self.qnetwork_local( tf.zeros( [ self.batch_size, 1, state_size ] ) )
+        self.qnetwork_target( tf.zeros( [ self.batch_size, 1, state_size ] ) )
+
+        # Replay memory
+        if self.priorized_exp:
+            self.memory = PrioritizedReplay( buffer_size, batch_size, 999, parallel_env = 1, n_step = 1 )
+        else:
+            self.memory = ReplayDiscreteSTransformerBuffer( state_size, sequence_size, buffer_size )
+        
+        # Initialize time step (for updating every UPDATE_EVERY steps)
+        self.t_step = 0
+    
+    def step(self, state, action, reward, next_state, done):
+        # Save experience in replay memory
+        self.memory.store( state, action, reward, next_state, done )
+  
+    def get_optimal_action(self, state, p_state):
+        z, p, _ = self.qnetwork_local( state, p_state )
+        z = z.numpy()[0,0,...]
+        q = np.mean( z, axis = 1 )
+        return np.argmax( q ), p
+    
+    def act(self, state, p_state, ep, train):
+                
+        eps = 1. / ((ep / 5000) + 1)
+        ac, past = self.get_optimal_action( state, p_state )
+        if np.random.rand() < eps and train:
+            return np.random.randint( 0, self.action_size ), past
+        else:
+            return ac, past
+
+    def learn(self):
+        
+        if self.priorized_exp:
+            transitions, idx, w = self.memory.sample_batch( self.batch_size )
+        else:
+            transitions = self.memory.sample_batch( self.batch_size )
+            w = tf.ones_like( transitions.r )
+
+        state_batch = transitions.s
+        action_batch = tf.one_hot( transitions.a, self.action_size, dtype = tf.float32 )
+        reward_batch = tf.cast( transitions.r, tf.float32 )
+        next_state_batch = transitions.sp
+        terminal_mask = tf.cast( transitions.it, tf.float32 )
+
+        q, _, _ = self.qnetwork_target( next_state_batch, None )
+        next_actions = np.argmax( np.mean( q, axis = 3 ), axis = 2 )
+        
+        one_hot_actions = tf.one_hot( next_actions, self.action_size, dtype = tf.float32 )
+        q_selected = tf.reduce_sum( one_hot_actions[:,:,:,tf.newaxis] * q, axis = 2 )
+        theta = ( 
+                    ( terminal_mask[:,:,tf.newaxis] * ( tf.ones( self.atoms ) * reward_batch[:,:,tf.newaxis] ) ) + 
+                    ( ( 1 - terminal_mask )[:,:,tf.newaxis] * ( reward_batch[:,:,tf.newaxis] + self.gamma * q_selected ) ) 
+                )
+                
+        td_error, th, msks = self.qnetwork_local.train( state_batch, theta, action_batch, reward_batch, terminal_mask )
+        
+        self.qnetwork_local.treward(tf.reduce_mean(reward_batch))
+
+        # ------------------- update target network ------------------- #
+        update( self.qnetwork_target, self.qnetwork_local, self.tau )
+
+        if self.priorized_exp:
+            self.memory.update_priorities( idx, abs( td_error.numpy() ) )
+
+        with self.qnetwork_local.train_summary_writer.as_default():
+            
+            tf.summary.scalar( 'l2 loss', self.qnetwork_local.train_l2_loss.result(), step = self.t_step )
+            tf.summary.scalar( 'dqn loss', self.qnetwork_local.train_loss.result(), step = self.t_step )
+            tf.summary.scalar( 'dqn reward', self.qnetwork_local.treward.result(), step = self.t_step )
+            tf.summary.scalar( 'dqn t reward', tf.reduce_mean(reward_batch), step = self.t_step )
+            
+            tf.summary.histogram( 'theta out', th, step = self.t_step )
+            tf.summary.histogram( 'theta target', tf.reduce_mean( theta, axis = -1 ), step = self.t_step )
+
+            tf.summary.histogram( 'l1h', self.qnetwork_local.fc1h.weights[0], step = self.t_step )
+            tf.summary.histogram( 'l1s', self.qnetwork_local.fc1s.weights[0], step = self.t_step )
+            tf.summary.histogram( 'l2', self.qnetwork_local.fc2.weights[0], step = self.t_step )
+            tf.summary.histogram( 'l3', self.qnetwork_local.fc3.weights[0], step = self.t_step )
+
+            for im, m in enumerate( msks ):
+                for x in range( m.shape.as_list()[ 1 ] ):
+                    v = m[:,x,:,:][:,:,:,tf.newaxis]
+                    tf.summary.image( 'layer_{}_head_{}'.format( im, x ), v, step = self.t_step, max_outputs = 1 )
 
         self.t_step += 1
 

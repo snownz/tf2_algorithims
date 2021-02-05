@@ -6,7 +6,7 @@ from tensorflow.keras import Sequential
 from tensorflow.keras.layers import Dense, Conv2D, Conv2DTranspose, Dropout, LayerNormalization, SimpleRNNCell, LSTMCell, GRUCell, RNN, Masking
 from tensorflow.keras.mixed_precision import LossScaleOptimizer
 from math import ceil
-from ann_utils import gather, flatten, conv1d, shape_list, Adam, norm, gelu, RMS, nalu, nalu_gru_cell
+from ann_utils import gather, flatten, conv1d, shape_list, Adam, norm, gelu, RMS, nalu, nalu_gru_cell, transformer_layer
 
 from functools import partial
 
@@ -186,7 +186,7 @@ class NALUQRNetwork(tf.Module):
         
         super(NALUQRNetwork, self).__init__()
         
-        self.module_type = 'QRNet'
+        self.module_type = 'NQRNet'
 
         self.to_train = train
         self.atoms = atoms
@@ -194,14 +194,14 @@ class NALUQRNetwork(tf.Module):
         self.action_dim = action_dim
         self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
         
-        self.fc1 = nalu( f1, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc2 = nalu( f2, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1 = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc2 = nalu( f2, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
         self.fc3 = nalu( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
 
         self.dp1 = tf.keras.layers.Dropout( .25 )
         self.dp2 = tf.keras.layers.Dropout( .25 )
 
-        self.log_dir = 'logs/qrnet_{}'.format(name)
+        self.log_dir = 'logs/nqrnet_{}'.format(name)
 
         if train:
 
@@ -757,9 +757,9 @@ class RecurrentNALUQRNetwork(tf.Module):
         self.action_dim = action_dim
         self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
                                 
-        self.fc1s = nalu( f1, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc1h = nalu( f1, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc2 = nalu( f2, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1s = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1h = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc2 = nalu( f2, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
         self.fc3 = nalu( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
 
         if typer == 's':
@@ -781,35 +781,23 @@ class RecurrentNALUQRNetwork(tf.Module):
             self.optimizer = Adam( tf.Variable( 2e-4 ) )
             
             if reduce == 'sum':
-                self.train = self.train_all_states
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_sum( huber_loss, axis = 1 ) )                
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss, axis = 1 ) )                
             
             elif reduce == 'mean':
-                self.train = self.train_all_states
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_mean( huber_loss, axis = 1 ) )
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_mean( loss, axis = 1 ) )
             
             elif reduce == 'sum_p':
-                self.train = self.train_all_states
                 p = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * max_len ) for i in range( 1, max_len + 1 ) ]
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_sum( huber_loss * p, axis = 1 ) )
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss * p, axis = 1 ) )
 
             elif reduce == 'sum_half':
-                self.train = self.train_all_states
                 p = [ int( i >= max_len // 2 ) for i in range( 0, max_len ) ]
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_sum( huber_loss * p, axis = 1 ) )
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss * p, axis = 1 ) )
 
             elif reduce == 'mean_half':
-                self.train = self.train_all_states
                 p = [ int( i >= max_len // 2 ) for i in range( 0, max_len ) ]
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_mean( huber_loss * p, axis = 1 ) )
-            
-            elif reduce == 'sum_end':
-                self.train = self.train_terminal
-                self.reduce_done = lambda huber_loss, terminal : tf.reduce_mean( tf.reduce_sum( huber_loss * terminal, axis = 1 ) )                        
-            
-            else:
-                self.train = self.train_end_state
-            
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_mean( loss * p, axis = 1 ) )
+                        
             if log:
                 run_number = 0
                 while os.path.exists(self.log_dir + str(run_number)):
@@ -819,7 +807,6 @@ class RecurrentNALUQRNetwork(tf.Module):
         
         self.train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
         self.train_l2_loss = tf.keras.metrics.Mean('train_l2_loss', dtype=tf.float32)
-        self.ereward = tf.keras.metrics.Mean('end reward', dtype=tf.float32)
         self.treward = tf.keras.metrics.Mean('total reward', dtype=tf.float32)
     
     def random_states(self, bs):
@@ -843,12 +830,12 @@ class RecurrentNALUQRNetwork(tf.Module):
         xt, *h = self.rnn( states, initial_state = p_state, training = self.log )
         
         xh = self.fc1h( xt )
-        xs = tf.nn.elu( self.fc1s( states ) )
+        xs = self.fc1s( states )
         
         x = xh + xs
         if self.log: x = self.dp1( x )
         
-        x = tf.nn.elu( self.fc2( x ) )
+        x = self.fc2( x )
         if self.log: x = self.dp2( x )        
         
         pred = self.fc3( x )
@@ -876,70 +863,7 @@ class RecurrentNALUQRNetwork(tf.Module):
         
         return loss
 
-    def train_end_state(self, states, target, actions, dones, we, step, bs):
-
-        bs, _, _ = shape_list( states )
-
-        with tf.GradientTape() as tape:
-
-            theta, _ = self( states, self.zero_states( bs ) )
-
-            huber_loss = self.quantile_huber_loss( target[:,-1,...], theta[:,-1,...], actions[:,-1,...] )            
-            loss = tf.reduce_mean( huber_loss )
-
-            l2_loss = ( 
-                tf.nn.l2_loss( self.fc1.weights[0] )
-                + tf.nn.l2_loss( self.fc1.weights[1] )
-                + tf.nn.l2_loss( self.fc2.weights[0] )
-                + tf.nn.l2_loss( self.fc2.weights[1] )
-                + tf.nn.l2_loss( self.fc3.weights[0] )
-                + tf.nn.l2_loss( self.fc3.weights[1] )
-            )
-            t_loss = loss + ( 2e-4 * l2_loss )
-            
-        gradients = tape.gradient( t_loss, self.trainable_variables )
-        self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
-
-        self.train_loss( loss )
-        self.train_l2_loss( 2e-4 * l2_loss )
-
-        return huber_loss, tf.reduce_mean( theta, axis = -1 )
-
-    def train_terminal(self, states, target, actions, dones, we, step, bs):
-
-        bs, ss, _ = shape_list( states )
-
-        with tf.GradientTape() as tape:
-
-            theta, _ = self( states, self.zero_states( bs ) )
-
-            theta = tf.reshape( theta, [ bs * ss, self.action_dim, self.atoms ] )
-            target = tf.reshape( target, [ bs * ss, self.atoms ] )
-            actions = tf.reshape( actions, [ bs * ss, self.action_dim ] )
-            we = tf.reshape( we, [ bs * ss ] )
-
-            huber_loss = tf.reshape( self.quantile_huber_loss( target, theta, actions ) * we, [ bs, ss ] )            
-            loss = self.reduce_done( huber_loss, dones )
-
-            l2_loss = ( 
-                tf.nn.l2_loss( self.fc1.weights[0] )
-                + tf.nn.l2_loss( self.fc1.weights[1] )
-                + tf.nn.l2_loss( self.fc2.weights[0] )
-                + tf.nn.l2_loss( self.fc2.weights[1] )
-                + tf.nn.l2_loss( self.fc3.weights[0] )
-                + tf.nn.l2_loss( self.fc3.weights[1] )
-            )
-            t_loss = loss + ( 2e-4 * l2_loss )
-            
-        gradients = tape.gradient( t_loss, self.trainable_variables )
-        self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
-
-        self.train_loss( loss )
-        self.train_l2_loss( 2e-4 * l2_loss )
-
-        return huber_loss, tf.reduce_mean( theta, axis = -1 )
-
-    def train_all_states(self, states, target, actions, dones, prev, we, step, bs):
+    def train(self, states, target, actions, dones, prev, we, step, bs):
 
         bs, *_ = shape_list( states )
 
@@ -961,79 +885,54 @@ class RecurrentNALUQRNetwork(tf.Module):
         return huber_loss, tf.reduce_mean( theta, axis = -1 )
 
 
-class RecurrentAgnosticQRNetwork(tf.Module):
+class TransformerNALUQRNetwork(tf.Module):
 
-    def __init__(self, state_dim, action_dim, name, f1, f2, r, atoms, max_len, 
-                typer='s', train=False, log=False, reduce='sum'):
+    def __init__(self, state_dim, action_dim, name, f1, f2, atoms, min_len, max_len, train=False, log=False, reduce='sum'):
         
-        super(RecurrentAgnosticQRNetwork, self).__init__()
+        super(TransformerNALUQRNetwork, self).__init__()
         
-        self.module_type = 'RAQRNet'
+        self.module_type = 'TNALUQRNet'
 
         self.to_train = train
         self.log = log
         self.atoms = atoms
-        self.r = r
-        self.f2 = f2
-        self.typer = typer
         self.action_dim = action_dim
         self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
                                 
-        self.fc1 = Dense( f1, kernel_initializer = tf.keras.initializers.orthogonal() )
-        self.fc2 = Dense( f2, kernel_initializer = tf.keras.initializers.orthogonal() )
-
-        self.fc3 = Dense( f2, kernel_initializer = tf.keras.initializers.orthogonal() )
-        self.fc4 = Dense( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.ones(), 
-                          trainable = False, use_bias = False )
-
-        if typer == 's':
-            self.fcr = SimpleRNNCell( r, activation = tf.nn.elu, dropout = 0 if log else .25 )
-        elif typer == 'g':
-            self.fcr = GRUCell( r, activation = tf.nn.elu, dropout = 0 if log else .25 )
-        elif typer == 'l':
-            self.fcr = LSTMCell( r, activation = tf.nn.elu, dropout = 0 if log else .25 )
+        self.fc1s = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1h = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc2 = nalu( f2, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc3 = nalu( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
            
-        self.rnn = RNN( self.fcr, return_sequences = True, return_state = True, unroll = True )
+        self.rnn = transformer_layer( f1, 4, 1, max_len )
 
         self.dp1 = tf.keras.layers.Dropout( .25 )
         self.dp2 = tf.keras.layers.Dropout( .25 )
 
-        self.log_dir = 'logs/raqrnet_{}'.format(name)
+        self.log_dir = 'logs/tnaluqrnet_{}'.format(name)
 
         if train:
             
             self.optimizer = Adam( tf.Variable( 2e-4 ) )
             
             if reduce == 'sum':
-                self.train = self.train_all_states
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_sum( huber_loss, axis = 1 ) )                
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss, axis = 1 ) )
             
             elif reduce == 'mean':
-                self.train = self.train_all_states
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_mean( huber_loss, axis = 1 ) )
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_mean( loss, axis = 1 ) )
             
             elif reduce == 'sum_p':
-                self.train = self.train_all_states
-                p = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * max_len ) for i in range( 1, max_len + 1 ) ]
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_sum( huber_loss * p, axis = 1 ) )
+                p = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * min_len ) for i in range( 1, min_len + 1 ) ]
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss * p, axis = 1 ) )
 
             elif reduce == 'sum_half':
-                self.train = self.train_all_states
-                p = [ int( i >= max_len // 2 ) for i in range( 0, max_len ) ]
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_sum( huber_loss * p, axis = 1 ) )
+                p = [ int( i >= min_len // 2 ) for i in range( 0, min_len ) ]
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss * p, axis = 1 ) )
 
             elif reduce == 'mean_half':
-                self.train = self.train_all_states
-                p = [ int( i >= max_len // 2 ) for i in range( 0, max_len ) ]
-                self.reduce = lambda huber_loss : tf.reduce_mean( tf.reduce_mean( huber_loss * p, axis = 1 ) )
-            
-            elif reduce == 'sum_end':
-                self.train = self.train_terminal
-                self.reduce_done = lambda huber_loss, terminal : tf.reduce_mean( tf.reduce_sum( huber_loss * terminal, axis = 1 ) )                        
-            
-            else:
-                self.train = self.train_end_state
-            
+                p = [ int( i >= min_len // 2 ) for i in range( 0, min_len ) ]
+                self.reduce = lambda loss : tf.reduce_mean( tf.reduce_mean( loss * p, axis = 1 ) )
+                        
             if log:
                 run_number = 0
                 while os.path.exists(self.log_dir + str(run_number)):
@@ -1043,56 +942,38 @@ class RecurrentAgnosticQRNetwork(tf.Module):
         
         self.train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
         self.train_l2_loss = tf.keras.metrics.Mean('train_l2_loss', dtype=tf.float32)
-        self.ereward = tf.keras.metrics.Mean('end reward', dtype=tf.float32)
         self.treward = tf.keras.metrics.Mean('total reward', dtype=tf.float32)
-    
-    def random_states(self, bs):
 
-        if self.typer == 's': return tf.random.normal( [ bs, self.r ] )
-        if self.typer == 'g': return tf.random.normal( [ bs, self.r ] )
-        if self.typer == 'l': return ( tf.random.normal( [ bs, self.r ] ), tf.random.normal( [ bs, self.r ] ) )
-
-    def zero_states(self, bs):
-
-        if self.typer == 's': return tf.zeros( [ bs, self.r ] )
-        if self.typer == 'g': return tf.zeros( [ bs, self.r ] )
-        if self.typer == 'l': return ( tf.zeros( [ bs, self.r ] ), tf.zeros( [ bs, self.r ] ) )
-
-    def encode(self, state):
-        x = state
-        x = tf.nn.elu( self.fc1( x ) )
-        if self.log: x = self.dp1( x )
-        x = tf.nn.elu( self.fc2( x ) )
-        if self.log: x = self.dp2( x )
-        return x
-
-    def decode(self, values, bs, ss):
-
-        pred_t = tf.reshape( self.fc3( tf.reshape( values, [ bs * ss, self.f2 ] ) ), [ bs, ss, self.f2 ] )
-        pred_a = tf.reshape( self.fc4( pred_t ), [ bs, ss, self.action_dim, self.atoms ] )
-        
-        return pred_a
-
-    def __call__(self, states, p_state):
+    def __call__(self, states, past=None):
         
         """Build a network that maps state -> action values."""        
-        bs, ss, sts = shape_list( states )
         
-        x = tf.reshape( 
-            self.encode( 
-                tf.reshape( states, [ bs * ss, sts ] ) ), 
-            [ bs, ss, self.f2 ] )
+        bs, ss, _ = shape_list( states )
 
-        xt, *x = self.rnn( x, initial_state = p_state )
+        # compute input embeding
+        xs = self.fc1s( states )
+
+        # compute temporal state
+        xt, h, msks = self.rnn( xs,  past )
+        xh = self.fc1h( xt )
         
-        return self.decode( xt, bs, ss ), x
+        # residual sum ( current state + temporal state )
+        x = xh + xs
+        if self.log: x = self.dp1( x )
+        
+        x = self.fc2( x )
+        if self.log: x = self.dp2( x )        
+        
+        pred = self.fc3( x )
+
+        return tf.reshape( pred, [ bs, ss, self.action_dim, self.atoms ] ), h, msks
     
     def quantile_huber_loss(self, target, pred, actions):
         
-        pred = tf.reduce_sum( pred * tf.expand_dims( actions, -1 ), axis = 1 )
-        pred_tile = tf.tile( tf.expand_dims( pred, axis = 2 ), [ 1, 1, self.atoms ] )
+        pred = tf.reduce_sum( pred * tf.expand_dims( actions, -1 ), axis = 2 )
+        pred_tile = tf.tile( tf.expand_dims( pred, axis = 3 ), [ 1, 1, 1, self.atoms ] )
         
-        target_tile = tf.cast( tf.tile( tf.expand_dims( target, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
+        target_tile = tf.cast( tf.tile( tf.expand_dims( target, axis = 2 ), [ 1, 1, self.atoms, 1 ] ), tf.float32 )
         
         # huber_loss = tf.math.square( pred_tile - target_tile )
         huber_loss = tf.compat.v1.losses.huber_loss( target_tile, pred_tile, reduction = tf.keras.losses.Reduction.NONE )
@@ -1103,107 +984,29 @@ class RecurrentAgnosticQRNetwork(tf.Module):
         inv_tau = tf.cast( tf.tile( tf.expand_dims( inv_tau, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
         
         error_loss = tf.math.subtract( target_tile, pred_tile )
-        loss = tf.where( tf.less( error_loss, 0.0 ), inv_tau * huber_loss, tau * huber_loss )
-        loss = tf.reduce_sum( tf.reduce_mean( loss, axis = 2 ), axis = 1 )
+        loss = tf.where( tf.less( error_loss, 0.0 ), inv_tau[:,tf.newaxis,:,:] * huber_loss, tau[:,tf.newaxis,:,:] * huber_loss )
+        loss = tf.reduce_sum( tf.reduce_mean( loss, axis = 3 ), axis = 2 )
         
         return loss
 
-    def train_end_state(self, states, target, actions, dones, we, step, bs):
-
-        bs, _, _ = shape_list( states )
+    def train(self, states, target, actions, rewards, dones):
 
         with tf.GradientTape() as tape:
 
-            theta, _ = self( states, self.zero_states( bs ) )
-
-            huber_loss = self.quantile_huber_loss( target[:,-1,...], theta[:,-1,...], actions[:,-1,...] )            
-            loss = tf.reduce_mean( huber_loss )
-
-            l2_loss = ( 
-                tf.nn.l2_loss( self.fc1.weights[0] )
-                + tf.nn.l2_loss( self.fc1.weights[1] )
-                + tf.nn.l2_loss( self.fc2.weights[0] )
-                + tf.nn.l2_loss( self.fc2.weights[1] )
-                + tf.nn.l2_loss( self.fc3.weights[0] )
-                + tf.nn.l2_loss( self.fc3.weights[1] )
-            )
-            t_loss = loss # + ( 2e-4 * l2_loss )
+            theta, _, msks = self( states )
             
-        gradients = tape.gradient( t_loss, self.trainable_variables )
-        self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
-
-        self.train_loss( loss )
-        self.train_l2_loss( 2e-4 * l2_loss )
-
-        return huber_loss, tf.reduce_mean( theta, axis = -1 )
-
-    def train_terminal(self, states, target, actions, dones, we, step, bs):
-
-        bs, ss, _ = shape_list( states )
-
-        with tf.GradientTape() as tape:
-
-            theta, _ = self( states, self.zero_states( bs ) )
-
-            theta = tf.reshape( theta, [ bs * ss, self.action_dim, self.atoms ] )
-            target = tf.reshape( target, [ bs * ss, self.atoms ] )
-            actions = tf.reshape( actions, [ bs * ss, self.action_dim ] )
-            we = tf.reshape( we, [ bs * ss ] )
-
-            huber_loss = tf.reshape( self.quantile_huber_loss( target, theta, actions ) * we, [ bs, ss ] )            
-            loss = self.reduce_done( huber_loss, dones )
-
-            l2_loss = ( 
-                tf.nn.l2_loss( self.fc1.weights[0] )
-                + tf.nn.l2_loss( self.fc1.weights[1] )
-                + tf.nn.l2_loss( self.fc2.weights[0] )
-                + tf.nn.l2_loss( self.fc2.weights[1] )
-                + tf.nn.l2_loss( self.fc3.weights[0] )
-                + tf.nn.l2_loss( self.fc3.weights[1] )
-            )
-            t_loss = loss # + ( 2e-4 * l2_loss )
-            
-        gradients = tape.gradient( t_loss, self.trainable_variables )
-        self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
-
-        self.train_loss( loss )
-        self.train_l2_loss( 2e-4 * l2_loss )
-
-        return huber_loss, tf.reduce_mean( theta, axis = -1 )
-
-    def train_all_states(self, states, target, actions, dones, we, step, bs):
-
-        bs, ss, _ = shape_list( states )
-
-        with tf.GradientTape() as tape:
-
-            theta, _ = self( states, None )
-
-            theta = tf.reshape( theta, [ bs * ss, self.action_dim, self.atoms ] )
-            target = tf.reshape( target, [ bs * ss, self.atoms ] )
-            actions = tf.reshape( actions, [ bs * ss, self.action_dim ] )
-            we = tf.reshape( we, [ bs * ss ] )
-
-            huber_loss = tf.reshape( self.quantile_huber_loss( target, theta, actions ) * we, [ bs, ss ] )            
+            huber_loss = self.quantile_huber_loss( target, theta, actions ) * tf.cast( rewards != 0, tf.float32 )
             loss = self.reduce( huber_loss )
 
-            l2_loss = ( 
-                tf.nn.l2_loss( self.fc1.weights[0] )
-                + tf.nn.l2_loss( self.fc1.weights[1] )
-                + tf.nn.l2_loss( self.fc2.weights[0] )
-                + tf.nn.l2_loss( self.fc2.weights[1] )
-                + tf.nn.l2_loss( self.fc3.weights[0] )
-                + tf.nn.l2_loss( self.fc3.weights[1] )
-            )
-            t_loss = loss + ( 2e-4 * l2_loss )
+            t_loss = loss
             
         gradients = tape.gradient( t_loss, self.trainable_variables )
         self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
 
         self.train_loss( loss )
-        self.train_l2_loss( 2e-4 * l2_loss )
+        self.train_l2_loss( 0 )
 
-        return huber_loss, tf.reduce_mean( theta, axis = -1 )
+        return huber_loss, tf.reduce_mean( theta, axis = -1 ), msks
 
 
 class C51Network(tf.Module):
