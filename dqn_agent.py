@@ -444,6 +444,7 @@ class NQRDqnAgent():
             tf.summary.scalar( 'l2 loss', self.qnetwork_local.train_l2_loss.result(), step = self.t_step )
             tf.summary.scalar( 'dqn loss', self.qnetwork_local.train_loss.result(), step = self.t_step )
             tf.summary.scalar( 'dqn reward', self.qnetwork_local.reward.result(), step = self.t_step )
+            tf.summary.scalar( 'dqn t reward', tf.reduce_mean(reward_batch), step = self.t_step )
             
             tf.summary.histogram( 'theta out', th, step = self.t_step )
             tf.summary.histogram( 'theta target', tf.reduce_mean( theta, axis = -1 ), step = self.t_step )

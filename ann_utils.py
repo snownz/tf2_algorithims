@@ -112,6 +112,7 @@ def positions_for(sequences, past_length):
     nsteps = tf.shape( sequences )[1]
     return expand_tile( past_length + tf.range( nsteps ), batch_size )
 
+
 class dense(Layer):
 
     def __init__(self, num_outputs, initializer=tf.keras.initializers.truncated_normal(), bias=True):
@@ -130,6 +131,7 @@ class dense(Layer):
         if self.use_bias:
             x += self.bias
         return x
+
 
 class nalu(Layer):
 
@@ -170,6 +172,7 @@ class nalu(Layer):
 
         return ( tf.nn.sigmoid( self.ga ) * trnaformation_x ) + ( ( 1 - tf.nn.sigmoid( self.ga ) ) * arithimetic_x )
 
+
 class simple_nac(Layer):
 
     def __init__(self, num_outputs, initializer=tf.keras.initializers.truncated_normal()):
@@ -189,6 +192,7 @@ class simple_nac(Layer):
         a = tf.matmul( input, w )
 
         return a
+
 
 class nalu_gru_cell(Layer):
 
@@ -236,6 +240,7 @@ class nalu_gru_cell(Layer):
 
         return h, h
 
+
 class conv2d(Layer):
 
     def __init__(self, kernel_size, channels, stride, padding="SAME", initializer=tf.keras.initializers.Orthogonal(), bias=True):
@@ -261,6 +266,7 @@ class conv2d(Layer):
             x = tf.nn.bias_add( x, self.bias, name = "_bias_add" )
         return x
 
+
 class conv1d(Layer):
 
     def __init__(self, nf, name, initializer=tf.keras.initializers.Orthogonal()):
@@ -282,6 +288,7 @@ class conv1d(Layer):
         cb = c + self.bias
         r = tf.reshape( cb, start + [ self.nf ] )
         return r
+
 
 class transformer_block(Layer):
 
@@ -314,6 +321,7 @@ class transformer_block(Layer):
         xm = x + m
 
         return xm, present, msk
+
 
 class transformer_layer(Layer):
 
@@ -348,6 +356,7 @@ class transformer_layer(Layer):
         present = tf.stack( presents, axis = 1 )
         return h, present, msks
 
+
 class norm(Layer):
 
     def __init__(self, axis=-1, epsilon=1e-5):
@@ -367,6 +376,7 @@ class norm(Layer):
         x = x * self.g + self.b
         return x
 
+
 class Adam(tf.keras.optimizers.Adam):
     
     def __init__(self, learning_rate, beta_1 = tf.Variable(0.9), beta_2 = tf.Variable(0.999), epsilon = tf.Variable(1e-7), decay = tf.Variable(0.0)):
@@ -376,6 +386,7 @@ class Adam(tf.keras.optimizers.Adam):
 
     def get_mixed_precision(self):
         return LossScaleOptimizer( self )
+
 
 class RMS(tf.keras.optimizers.RMSprop):
     

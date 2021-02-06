@@ -266,7 +266,7 @@ class NALUQRNetwork(tf.Module):
                 + tf.nn.l2_loss( self.fc3.weights[3] )
                 + tf.nn.l2_loss( self.fc3.weights[5] ) 
             )
-            t_loss = loss + ( 2e-6 * l2_loss )
+            t_loss = loss # + ( 2e-6 * l2_loss )
             
         gradients = tape.gradient( t_loss, self.trainable_variables )
         self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
