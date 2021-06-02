@@ -32,21 +32,7 @@ args.sequence = 16
 args.buffer_size = 15000
 args.num_steps = 2000000
 
-# args.experiment = 'rqrdqn_simple_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_endseq'
-# args.experiment = 'rqrdqn_simple_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_sumseq'
-# args.experiment = 'rqrdqn_simple_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_meanseq'
-# args.experiment = 'rqrdqn_simple_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_sumpondseq'
-
-# args.experiment = 'rqrdqn_gru_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_endseq'
-# args.experiment = 'rqrdqn_gru_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_sumseq'
-# args.experiment = 'rqrdqn_gru_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_meanseq'
-# args.experiment = 'rqrdqn_gru_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_sumpondseq'
-
-# args.experiment = 'rqrdqn_lstm_8atoms_s256x128x128_bs128_seq64_adam2e4_noper_normal_nonstep_meanhalf'
 args.experiment = 'rqrdqn_gru_8atoms_s256x128x128_bs32_seq32_adam2e4_noper_normal_nonstep_sumhalf'
-# args.experiment = 'rqrdqn_lstm_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_sumseq'
-# args.experiment = 'rqrdqn_lstm_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_meanseq'
-# args.experiment = 'rqrdqn_lstm_8atoms_s256x128x128_bs128_seq64_rms2e4_noper_normal_nonstep_l2loss_sumpondseq'
 
 args.load = False
 args.train = True

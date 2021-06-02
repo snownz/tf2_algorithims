@@ -24,16 +24,16 @@ args.normalize_obs = False
 args.noise  = 'normal'
 args.gamma = 0.99
 args.tau = 5e-3
-args.batch_size = 128
+args.batch_size = 1024
 args.epochs = None
 args.epoch_cycles = 2000
 args.rollout_steps = 1000
-args.max_sequence = 128
-args.sequence = 128
-args.buffer_size = 15000
+args.max_sequence = 16
+args.sequence = 16
+args.buffer_size = 1024*100
 args.num_steps = 2000000
 
-args.experiment = 'tqrdqn_gru_8atoms_s256x128x128_bs32_seq32_adam2e4_noper_normal_nonstep_sumhalf'
+args.experiment = 'tqrdqn_8atoms_bs1024_seq16_adam2e4_noper_nonstep_sumhalf_0'
 
 args.load = False
 args.train = True
@@ -44,7 +44,7 @@ args.state_dim = env.observation_space.shape[0]
 
 dqn = TransformerQRDqnAgent( args.state_dim, args.action_dim, args.buffer_size, args.batch_size, 
                              args.sequence, args.experiment, 256, 128, 8, args.max_sequence,
-                             priorized_exp = False, reduce = 'sum', train = args.train )
+                             priorized_exp = False, reduce = 'sum_half', train = args.train )
 
 base_dir = os.getcwd() + '/models/' + args.environment + '_' + args.experiment + '/'
 run_number = 0
@@ -66,8 +66,6 @@ else:
 """
 training loop
 """
-count = 0
-count_down = 64
 total_steps = 0
 train_steps = 0
 
@@ -113,7 +111,7 @@ for epoch in bar:
             
             if len( p_state ) == args.sequence:
                 p_state.pop( 0 )
-                p_state.append( past )
+            p_state.append( past )
 
             episode_rewards += reward
 
@@ -121,14 +119,14 @@ for epoch in bar:
             # episode_rewards
             if is_terminal:
 
-                p_state = []          
+                p_state = []
                 states = list( np.zeros( [ args.sequence, args.state_dim ] ) )
                 states_ = list( np.zeros( [ args.sequence, args.state_dim ] ) )
                 rewards = list( np.zeros( [ args.sequence ] ) )
                 actions = list( np.zeros( [ args.sequence ] ) )
                 dones = list( np.zeros( [ args.sequence ] ) )
                 
-                state = np.float32(env.reset())                
+                state = np.float32(env.reset())
                 episode_steps = 0
                 episode_rewards = 0
 
@@ -142,17 +140,14 @@ for epoch in bar:
 
             total_steps += 1
 
-            if len(dqn.memory) >= args.batch_size * 4 and args.train:            
-                dqn.learn()
-                train_steps += 1
-
             bar.set_description('Steps: {} - TSteps: {} - Buffer: {} - Past: {}'.format( total_steps, train_steps, len(dqn.memory), len( p_state ) ) )
             bar.refresh() # to show immediately the update
 
-        # if len(dqn.memory) >= args.batch_size * 4 and args.train:            
-            # for _ in range( args.rollout_steps // 2 ):
-            #     dqn.learn()
-            #     train_steps += 1
-            
-        if train_steps % 10000 == 0 and args.train:
+        if args.train:
+
+            if len(dqn.memory) >= args.batch_size * 4:
+                for _ in range( 10 ):
+                    dqn.learn()
+                    train_steps += 1
+
             dqn.save_training( base_dir + 'training/' )

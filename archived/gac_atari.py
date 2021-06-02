@@ -4,11 +4,11 @@ import numpy as np
 import tensorflow as tf
 from tqdm import trange
 
-from ounoise import ActionNoise, NormalActionNoise, OrnsteinUhlenbeckActionNoise
+from archived.ounoise import ActionNoise, NormalActionNoise, OrnsteinUhlenbeckActionNoise
 
-from gac_net import AutoRegressiveStochasticActor as AIQN
-from gac_net import StochasticActor as IQN
-from gac_net import Critic, Value
+from archived.gac_net import AutoRegressiveStochasticActor as AIQN
+from archived.gac_net import StochasticActor as IQN
+from archived.gac_net import Critic, Value
 from gac_agent import GACAgent
 from ann_utils import categorical_sample
 

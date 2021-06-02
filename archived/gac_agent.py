@@ -3,8 +3,8 @@ import numpy as np
 import tensorflow as tf
 
 # import local dependencies
-from gac_net import StochasticActor, AutoRegressiveStochasticActor,  Critic, Value
-from helpers import ReplayBuffer, update, ActionSampler, normalize, denormalize
+from archived.gac_net import StochasticActor, AutoRegressiveStochasticActor,  Critic, Value
+from helpers import ReplayDiscreteBuffer, update, ActionSampler, normalize, denormalize
 from utils import RunningMeanStd
 
 
@@ -65,10 +65,7 @@ class GACAgent:
         if actor == 'IQN':
             self.actor = StochasticActor(self.state_dim, self.action_dim, 'source')
             self.target_actor = StochasticActor(self.state_dim, self.action_dim, 'target')
-        elif actor == 'AIQN':
-            self.actor = AutoRegressiveStochasticActor(self.state_dim, self.action_dim)
-            self.target_actor = AutoRegressiveStochasticActor(self.state_dim, self.action_dim)
-
+        
         if self.normalize_observations:
             self.obs_rms = RunningMeanStd(shape=self.state_dim)
         else:
@@ -117,7 +114,7 @@ class GACAgent:
         update(self.target_critics, self.critics, 1.0)
         update(self.target_value, self.value, 1.0)
 
-        self.replay = ReplayBuffer(self.state_dim, self.action_dim, self.buffer_size)
+        self.replay = ReplayDiscreteBuffer(self.state_dim, self.action_dim, self.buffer_size)
         self.action_sampler = ActionSampler(self.actor.action_dim)
 
     def train_one_step(self):

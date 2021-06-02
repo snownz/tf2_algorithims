@@ -1,9 +1,11 @@
 import random
+from matplotlib.animation import AVConvBase
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.layers import Dense
 from collections import namedtuple, deque
+import pandas as pd
 
 class ReplayContinuosBuffer:
   
@@ -67,6 +69,10 @@ class ReplayDiscreteBuffer(object):
         if prev_size < self.size:
             self.size_list = range(self.size)
 
+    def storem(self, obss, acts, rews, next_obss, dones):
+        for obs, act, rew, next_obs, done in zip( obss, acts, rews, next_obss, dones ):
+            self.store( obs, act, rew, next_obs, done )
+
     def sample_batch(self, batch_size=32):
         idxs = random.sample(self.size_list, batch_size)
         self.transitions.s = tf.convert_to_tensor(self.obs1_buf[idxs])
@@ -74,6 +80,323 @@ class ReplayDiscreteBuffer(object):
         self.transitions.r = tf.convert_to_tensor(self.rews_buf[idxs])
         self.transitions.sp = tf.convert_to_tensor(self.obs2_buf[idxs])
         self.transitions.it = tf.convert_to_tensor(self.done_buf[idxs])
+        return self.transitions
+
+    def __len__(self):
+        return self.size
+
+
+class ReplayDiscreteBufferPandas(object):
+
+    def __init__(self, max_size):
+
+        self.transitions = namedtuple('transition', ['s', 'a', 'r', 'sp', 'it'])
+
+        di = {
+            'state': [],
+            'state_': [],
+            'acts': [],
+            'rewards': [],
+            'dones': []
+        }
+        self.df = pd.DataFrame.from_dict( di )
+        self.max_size = max_size
+
+    def store(self, obs, act, rew, next_obs, done):
+
+        row = { 'state': obs, 'state_': next_obs, 'acts': act, 'rewards': rew, 'dones': done}
+
+        if len(self) >= ( self.max_size + ( 0.3 * self.max_size ) ):
+            self.df = self.df.iloc[int( 0.3 * self.max_size ):]
+            
+        self.df = self.df.append( row, ignore_index = True, sort = False )
+        
+    def storem(self, obss, acts, rews, next_obss, dones):
+        for obs, act, rew, next_obs, done in zip( obss, acts, rews, next_obss, dones ):
+            self.store( obs, act, rew, next_obs, done )
+
+    def sample_batch(self, batch_size=32):
+
+        batch = self.df.sample( n = batch_size ).values
+        
+        self.transitions.s  = tf.convert_to_tensor( np.asarray( list( batch[:,0] ) ) )
+        self.transitions.sp = tf.convert_to_tensor( np.asarray( list( batch[:,1] ) ) )
+        self.transitions.a  = tf.convert_to_tensor( np.asarray( list( batch[:,2] ) ), dtype = tf.int32)
+        self.transitions.r  = tf.convert_to_tensor( np.asarray( list( batch[:,3] ) ) )
+        self.transitions.it = tf.convert_to_tensor( np.asarray( list( batch[:,4] ) ) )
+        return self.transitions
+
+    def __len__(self):
+        return self.df.count()[0]
+
+
+
+class ReplayDiscreteNTMBuffer(object):
+
+    def __init__(self, obs_dim, size):
+        self.transitions = namedtuple('transition', ['s', 'a', 'r', 'sp', 'it', 's_', 'M', 'MP', 'w', 'av', 'rd'])
+        # (this_state, this_action, this_reward, next_state, this_is_terminal)
+
+        self.obs1_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.obs2_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.acts_buf = np.zeros([size, ], dtype=np.float32)
+        self.rews_buf = np.zeros([size, ], dtype=np.float32)
+        self.done_buf = np.zeros([size, ], dtype=np.float32)
+        
+        self.obs3_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.memory_buf = np.zeros([size, 128, 20], dtype=np.float32)
+        self.pmemory_buf = np.zeros([size, 128, 20], dtype=np.float32)
+        self.wgh_buf = np.zeros([size, 128], dtype=np.float32)
+        self.acval_buf = np.zeros([size, 4], dtype=np.float32)
+        self.rd_buf = np.zeros([size, 16], dtype=np.float32)
+
+        self.ptr, self.size, self.max_size = 0, 0, size
+        self.size_list = range(self.size)
+
+    def store(self, obs, act, rew, next_obs, done, _state, M_t, p_M_t, w_t_1, av, rd):
+        
+        self.obs1_buf[self.ptr] = obs
+        self.obs2_buf[self.ptr] = next_obs
+        self.acts_buf[self.ptr] = act
+        self.rews_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+
+        self.obs3_buf[self.ptr] = _state
+        self.memory_buf[self.ptr] = M_t
+        self.pmemory_buf[self.ptr] = p_M_t
+        self.wgh_buf[self.ptr] = w_t_1
+        self.acval_buf[self.ptr] = av
+        self.rd_buf[self.ptr] = rd
+        
+        self.ptr = (self.ptr+1) % self.max_size
+        prev_size = self.size
+        self.size = min(self.size+1, self.max_size)
+        if prev_size < self.size:
+            self.size_list = range(self.size)
+
+    def sample_batch(self, batch_size=32):
+        
+        idxs = random.sample(self.size_list, batch_size)
+        
+        self.transitions.s = tf.convert_to_tensor(self.obs1_buf[idxs])
+        self.transitions.a = tf.convert_to_tensor(self.acts_buf[idxs], dtype = tf.int32)
+        self.transitions.r = tf.convert_to_tensor(self.rews_buf[idxs])
+        self.transitions.sp = tf.convert_to_tensor(self.obs2_buf[idxs])
+        self.transitions.it = tf.convert_to_tensor(self.done_buf[idxs])
+
+        self.transitions.s_ = tf.convert_to_tensor(self.obs3_buf[idxs])
+        self.transitions.M = tf.convert_to_tensor(self.memory_buf[idxs])
+        self.transitions.MP = tf.convert_to_tensor(self.pmemory_buf[idxs])
+        self.transitions.w = tf.convert_to_tensor(self.wgh_buf[idxs])
+        self.transitions.av = tf.convert_to_tensor(self.acval_buf[idxs])
+        self.transitions.rd = tf.convert_to_tensor(self.rd_buf[idxs])
+        
+        return self.transitions
+
+    def __len__(self):
+        return self.size
+
+
+class ReplayDiscreteDNCBuffer(object):
+
+    def __init__(self, obs_dim, size, m, n):
+        
+        self.transitions = namedtuple('transition', ['s', 'a', 'r', 'sp', 'it', 's_', 'av', 'rd', 'm', 'u', 'l', 'wp', 'wr', 'ww'])
+
+        self.obs_dim = obs_dim
+        self.sz = size
+        self.m = m
+        self.n = n
+
+        self.obs1_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.obs2_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.acts_buf = np.zeros([size, ], dtype=np.float32)
+        self.rews_buf = np.zeros([size, ], dtype=np.float32)
+        self.done_buf = np.zeros([size, ], dtype=np.float32)
+        
+        self.obs3_buf = np.zeros([size, obs_dim], dtype=np.float32)
+        self.acval_buf = np.zeros([size, 4], dtype=np.float32)
+        self.rd_buf = np.zeros([size, 16], dtype=np.float32)
+
+        self.m_buf = np.zeros([size, m, n], dtype=np.float32)
+        self.u_buf = np.zeros([size, m, 1], dtype=np.float32)
+        self.l_buf = np.zeros([size, m, m], dtype=np.float32)
+        self.wp_buf = np.zeros([size, m, 1], dtype=np.float32)
+        self.wr_buf = np.zeros([size, m, 3], dtype=np.float32)
+        self.ww_buf = np.zeros([size, m, 1], dtype=np.float32)
+
+        self.ptr, self.size, self.max_size = 0, 0, size
+        self.size_list = range(self.size)
+
+    def store(self, obs, act, rew, next_obs, done, _state, av, rd, M, usage, L, W_precedence, W_read, W_write):
+        
+        self.obs1_buf[self.ptr] = obs
+        self.obs2_buf[self.ptr] = next_obs
+        self.acts_buf[self.ptr] = act
+        self.rews_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+
+        self.obs3_buf[self.ptr] = _state
+        self.acval_buf[self.ptr] = av
+        self.rd_buf[self.ptr] = rd
+
+        self.m_buf[self.ptr] = M
+        self.u_buf[self.ptr] = usage
+        self.l_buf[self.ptr] = L
+        self.wp_buf[self.ptr] = W_precedence
+        self.wr_buf[self.ptr] = W_read
+        self.ww_buf[self.ptr] = W_write        
+        
+        self.ptr = (self.ptr+1) % self.max_size
+        prev_size = self.size
+        self.size = min(self.size+1, self.max_size)
+        if prev_size < self.size:
+            self.size_list = range(self.size)
+
+    def sample_batch(self, batch_size=32):
+        
+        idxs = [ x for x in range( self.ptr ) ]
+        
+        self.transitions.s = tf.convert_to_tensor(self.obs1_buf[idxs])
+        self.transitions.a = tf.convert_to_tensor(self.acts_buf[idxs], dtype = tf.int32)
+        self.transitions.r = tf.convert_to_tensor(self.rews_buf[idxs])
+        self.transitions.sp = tf.convert_to_tensor(self.obs2_buf[idxs])
+        self.transitions.it = tf.convert_to_tensor(self.done_buf[idxs])
+
+        self.transitions.s_ = tf.convert_to_tensor(self.obs3_buf[idxs])
+        self.transitions.av = tf.convert_to_tensor(self.acval_buf[idxs])
+        self.transitions.rd = tf.convert_to_tensor(self.rd_buf[idxs])
+
+        self.transitions.m = tf.convert_to_tensor(self.m_buf[idxs])
+        self.transitions.u = tf.convert_to_tensor(self.u_buf[idxs])
+        self.transitions.l = tf.convert_to_tensor(self.l_buf[idxs])
+        self.transitions.wp = tf.convert_to_tensor(self.wp_buf[idxs])
+        self.transitions.wr = tf.convert_to_tensor(self.wr_buf[idxs])
+        self.transitions.ww = tf.convert_to_tensor(self.ww_buf[idxs])
+                
+        return self.transitions
+
+    def reset(self):
+
+        del self.obs1_buf
+        del self.obs2_buf
+        del self.acts_buf
+        del self.rews_buf
+        del self.done_buf
+        del self.obs3_buf
+        del self.acval_buf
+        del self.rd_buf
+        del self.m_buf
+        del self.u_buf
+        del self.l_buf
+        del self.wp_buf
+        del self.wr_buf
+        del self.ww_buf
+
+        self.obs1_buf = np.zeros([self.sz, self.obs_dim], dtype=np.float32)
+        self.obs2_buf = np.zeros([self.sz, self.obs_dim], dtype=np.float32)
+        self.acts_buf = np.zeros([self.sz, ], dtype=np.float32)
+        self.rews_buf = np.zeros([self.sz, ], dtype=np.float32)
+        self.done_buf = np.zeros([self.sz, ], dtype=np.float32)
+        
+        self.obs3_buf = np.zeros([self.sz, self.obs_dim], dtype=np.float32)
+        self.acval_buf = np.zeros([self.sz, 4], dtype=np.float32)
+        self.rd_buf = np.zeros([self.sz, 16], dtype=np.float32)
+
+        self.m_buf = np.zeros([self.sz, self.m, self.n], dtype=np.float32)
+        self.u_buf = np.zeros([self.sz, self.m, 1], dtype=np.float32)
+        self.l_buf = np.zeros([self.sz, self.m, self.m], dtype=np.float32)
+        self.wp_buf = np.zeros([self.sz, self.m, 1], dtype=np.float32)
+        self.wr_buf = np.zeros([self.sz, self.m, 3], dtype=np.float32)
+        self.ww_buf = np.zeros([self.sz, self.m, 1], dtype=np.float32)
+
+        self.ptr, self.size, self.max_size = 0, 0, self.sz
+        self.size_list = range(self.size)
+
+    def __len__(self):
+        return self.size
+
+
+class ReplaySequenceDiscreteDNCBuffer(object):
+
+    def __init__(self, obs_dim, s, size, m, n, h):
+        
+        self.transitions = namedtuple('transition', ['s', 'a', 'r', 'sp', 'it', 's_', 'tw', 'm', 'u', 'l', 'wp', 'wr', 'ww', 'step'])
+
+        self.obs_dim = obs_dim
+        self.sz = size
+        self.m = m
+        self.n = n
+
+        self.obs1_buf = np.zeros([size, s, obs_dim], dtype=np.float32)
+        self.obs2_buf = np.zeros([size, s, obs_dim], dtype=np.float32)
+        self.acts_buf = np.zeros([size, s, ], dtype=np.float32)
+        self.rews_buf = np.zeros([size, s, ], dtype=np.float32)
+        self.done_buf = np.zeros([size, s, ], dtype=np.float32)
+        self.tw_buf = np.zeros([size, s, m*2], dtype=np.float32)
+        
+        self.obs3_buf = np.zeros([size, s, obs_dim], dtype=np.float32)
+
+        self.m_buf = np.zeros([size, m, n], dtype=np.float32)
+        self.u_buf = np.zeros([size, m, 1], dtype=np.float32)
+        self.l_buf = np.zeros([size, m, m], dtype=np.float32)
+        self.wp_buf = np.zeros([size, m, 1], dtype=np.float32)
+        self.wr_buf = np.zeros([size, m, h], dtype=np.float32)
+        self.ww_buf = np.zeros([size, m, 1], dtype=np.float32)
+
+
+        self.step_buf = np.zeros([size, 1], dtype=np.float32)
+        
+        self.ptr, self.size, self.max_size = 0, 0, size
+        self.size_list = range(self.size)
+
+    def store(self, obs, act, rew, next_obs, done, _state, tw, M, usage, L, W_precedence, W_read, W_write, step):
+        
+        self.obs1_buf[self.ptr] = obs
+        self.obs2_buf[self.ptr] = next_obs
+        self.acts_buf[self.ptr] = act
+        self.rews_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+        self.tw_buf[self.ptr] = tw
+
+        self.obs3_buf[self.ptr] = _state
+        self.step_buf[self.ptr] = step
+
+        self.m_buf[self.ptr] = M
+        self.u_buf[self.ptr] = usage
+        self.l_buf[self.ptr] = L
+        self.wp_buf[self.ptr] = W_precedence
+        self.wr_buf[self.ptr] = W_read
+        self.ww_buf[self.ptr] = W_write
+        
+        self.ptr = (self.ptr+1) % self.max_size
+        prev_size = self.size
+        self.size = min(self.size+1, self.max_size)
+        if prev_size < self.size:
+            self.size_list = range(self.size)
+
+    def sample_batch(self, batch_size=32):
+        
+        idxs = random.sample( self.size_list, batch_size )
+        
+        self.transitions.s = tf.convert_to_tensor(self.obs1_buf[idxs])
+        self.transitions.a = tf.convert_to_tensor(self.acts_buf[idxs], dtype = tf.int32)
+        self.transitions.r = tf.convert_to_tensor(self.rews_buf[idxs])
+        self.transitions.sp = tf.convert_to_tensor(self.obs2_buf[idxs])
+        self.transitions.it = tf.convert_to_tensor(self.done_buf[idxs])
+        self.transitions.tw = tf.convert_to_tensor(self.tw_buf[idxs])
+
+        self.transitions.s_ = tf.convert_to_tensor(self.obs3_buf[idxs])
+
+        self.transitions.m = tf.convert_to_tensor(self.m_buf[idxs])
+        self.transitions.u = tf.convert_to_tensor(self.u_buf[idxs])
+        self.transitions.l = tf.convert_to_tensor(self.l_buf[idxs])
+        self.transitions.wp = tf.convert_to_tensor(self.wp_buf[idxs])
+        self.transitions.wr = tf.convert_to_tensor(self.wr_buf[idxs])
+        self.transitions.ww = tf.convert_to_tensor(self.ww_buf[idxs])
+
+        self.transitions.step = tf.convert_to_tensor(self.step_buf[idxs])
+                
         return self.transitions
 
     def __len__(self):
@@ -135,38 +458,43 @@ class ReplayDiscreteSequenceBuffer(object):
 class ReplayDiscreteSTransformerBuffer(object):
 
     def __init__(self, obs_dim, seq_dim, size):
-        self.transitions = namedtuple('transition', ['s', 'a', 'r', 'sp', 'it'])
+        self.transitions = namedtuple('transition', ['s', 'a', 'r', 'sp', 'it', 'm'])
 
         self.obs1_buf = np.zeros([size, seq_dim, obs_dim], dtype=np.float32)
         self.obs2_buf = np.zeros([size, seq_dim, obs_dim], dtype=np.float32)
         self.acts_buf = np.zeros([size, seq_dim, ], dtype=np.float32)
         self.rews_buf = np.zeros([size, seq_dim, ], dtype=np.float32)
         self.done_buf = np.zeros([size, seq_dim, ], dtype=np.float32)
+        self.mask_buf = np.zeros([size, seq_dim ], dtype=np.float32)
         self.ptr, self.size, self.max_size = 0, 0, size
         self.size_list = range(self.size)
 
-    def calc_multistep_return(self, n_step_buffer):
+    def calc_multistep_return(self, n_step_buffer, mask):
         Return = 0
         R = []
-        v = n_step_buffer == 0.0
-        ln = len( n_step_buffer )
-        init = np.argmin( v ) if np.add.reduce( v ) < len( n_step_buffer ) else len( n_step_buffer )
+        ln = np.argmin( mask )
+        init = 0
         for idx in range( init, ln ):
-            Return += n_step_buffer[idx] # 0.99**idx * n_step_buffer[idx]
+            Return += n_step_buffer[idx]
             R.append( Return / ( ( idx - init ) + 1 ) )
-        return np.array( ( init * [ 0 ] ) + R )
+        return np.array( R + ( ( len( mask ) - ln ) * [ 0 ] ) )
 
-    def store(self, obs, act, rew, next_obs, done):
+    def store(self, obs, act, rew, next_obs, done, mask):
         self.obs1_buf[self.ptr] = obs
         self.obs2_buf[self.ptr] = next_obs
         self.acts_buf[self.ptr] = act
-        self.rews_buf[self.ptr] = rew + 0.1 * self.calc_multistep_return( rew )
+        self.rews_buf[self.ptr] = rew + 0.1 * self.calc_multistep_return( rew, mask )
         self.done_buf[self.ptr] = done
+        self.mask_buf[self.ptr] = mask
         self.ptr = (self.ptr+1) % self.max_size
         prev_size = self.size
         self.size = min(self.size+1, self.max_size)
         if prev_size < self.size:
             self.size_list = range(self.size)
+
+    def storem(self, obss, acts, rews, next_obss, dones):
+        for obs, act, rew, next_obs, done in zip( obss, acts, rews, next_obss, dones ):
+            self.store( obs[0], act[0], rew, next_obs, done )
 
     def sample_batch(self, batch_size=32):
         idxs = random.sample(self.size_list, batch_size)
@@ -175,6 +503,7 @@ class ReplayDiscreteSTransformerBuffer(object):
         self.transitions.r = tf.convert_to_tensor(self.rews_buf[idxs])
         self.transitions.sp = tf.convert_to_tensor(self.obs2_buf[idxs])
         self.transitions.it = tf.convert_to_tensor(self.done_buf[idxs])
+        self.transitions.m = tf.convert_to_tensor(self.mask_buf[idxs])
         return self.transitions
 
     def __len__(self):

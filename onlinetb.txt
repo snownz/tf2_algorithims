@@ -1,0 +1,3 @@
+tensorboard dev upload --logdir logs \
+    --name "Lunar Lander" \
+    --description "Lunar lander test"

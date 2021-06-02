@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow as tf
 from tqdm import trange
 
-from dqn_agent import NQRDqnAgent
+from dqn_agent import QRDqnAgent, NQRDqnAgent, AGNNQRDqnAgent
 
 print(tf.__version__)
 print("GPU Available: ", tf.test.is_gpu_available())
@@ -15,14 +15,14 @@ class Obj(object):
 
 args = Obj()
 
-args.environment = "LunarLander-v2"
-args.batch_size = 2048
+args.environment = "gym_rocketlander:rocketlander-v0"
+args.batch_size = 1024
 args.epochs = None
-args.epoch_cycles = 2
+args.epoch_cycles = 20
 args.rollout_steps = 1000
-args.buffer_size = 30000
+args.buffer_size = 100000
 args.num_steps = 2000000
-args.experiment = 'nqrdqn_8atoms_s256x128_bs4096_adam2e4_noper_normal_nonstep_l2loss_v0'
+args.experiment = 'rocket_nqrdqn_8atoms_s256x128_bs1024_adam2e4_noper_normal_nonstep_l2loss_v2'
 args.load = False
 args.train = True
 
@@ -30,7 +30,7 @@ env = gym.make( args.environment )
 args.action_dim = env.action_space.n
 args.state_dim = env.observation_space.shape[0]
 
-dqn = NQRDqnAgent( args.state_dim, args.action_dim, args.buffer_size, args.batch_size, args.experiment, 128, 64, 8, args.train, tau = 1e-3 )
+dqn = NQRDqnAgent( args.state_dim, args.action_dim, args.buffer_size, args.batch_size, args.experiment, 256, 128, 8, args.train, priorized_exp = False )
 
 base_dir = os.getcwd() + '/models/' + args.environment + '_' + args.experiment + '/'
 run_number = 0
@@ -54,9 +54,9 @@ training loop
 """
 count = 0
 total_steps = 0
-train_steps = dqn.t_step
+train_steps = 0
 
-bar = trange(1000000)
+bar = trange(nb_epochs)
 for epoch in bar:
     for cycle in range(args.epoch_cycles):
         for rollout in range(args.rollout_steps):
@@ -67,7 +67,6 @@ for epoch in bar:
             
             # remove the batch_size dimension if batch_size == 1
             next_state, reward, is_terminal, _ = env.step(action)
-            reward /= 10.0
             next_state, reward = np.float32(next_state), np.float32(reward)
             
             dqn.step( state, action, reward, next_state, is_terminal )
@@ -84,7 +83,6 @@ for epoch in bar:
                 episode_steps += 1
 
             if not args.train:
-                # if total_steps%10==0:
                 env.render()
 
             total_steps += 1
@@ -92,8 +90,7 @@ for epoch in bar:
             bar.set_description('Steps: {} - TSteps: {} - Esteps: {}'.format( total_steps, train_steps, episode_steps ) )
             bar.refresh() # to show immediately the update
 
-        if len(dqn.memory) >= args.batch_size * 4 and args.train:
-            for _ in range( 20 ):
+            if len(dqn.memory) >= args.batch_size * 4 and args.train:
                 dqn.learn()
                 train_steps += 1
 

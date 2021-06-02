@@ -1,3 +1,4 @@
+from select import select
 import tensorflow as tf 
 import numpy as np
 import math
@@ -5,8 +6,12 @@ import numpy as no
 from tensorflow.keras import Sequential
 from tensorflow.keras.layers import Dense, Conv2D, Conv2DTranspose, Dropout, LayerNormalization, SimpleRNNCell, LSTMCell, GRUCell, RNN, Masking
 from tensorflow.keras.mixed_precision import LossScaleOptimizer
+from tensorflow.keras.activations import softmax, elu, relu, tanh
+from tensorflow.keras.initializers import he_normal, orthogonal, random_normal, truncated_normal
+import tensorflow_probability as tfp
 from math import ceil
-from ann_utils import gather, flatten, conv1d, shape_list, Adam, norm, gelu, RMS, nalu, nalu_gru_cell, transformer_layer
+from ann_utils import gather, flatten, conv1d, shape_list, Adam, gelu, RMS, nalu_transform, nalu_gru_cell, transformer_layer, ntm_plus_memory, dnc, tdnc, tdnc_v2, dense
+from cognitive_model import StateUnderstanding, StateUnderstanding_v2, GlobalMemory, FeatureCreator, Actor, Critic, FakeActor, ActorMultiEnv_v2, StateUnderstandingMultiEnv_v3, Actorv2
 
 from functools import partial
 
@@ -54,14 +59,14 @@ class QNetwork(tf.Module):
         # Get max predicted Q values (for next states) from target model
         Q_targets_next = tf.reduce_max( target_net( next_states ), axis = -1 )
         
-        # Compute Q targets for current states 
+        # Compute Q targets for current states
         Q_targets = tf.cast( rewards, tf.float32 ) + ( gamma * Q_targets_next * ( 1 - tf.cast( dones, tf.float32 ) ) )
 
         with tf.GradientTape() as tape:
             # Get expected Q values from local model
             Q_expected = gather( self( states ), actions )
             mse = tf.math.square( Q_expected - Q_targets ) * w
-            loss = tf.reduce_mean( mse )        
+            loss = tf.reduce_mean( mse )
         gradients = tape.gradient( loss, self.trainable_variables )
         
         if gradient_noise:
@@ -160,14 +165,14 @@ class QRNetwork(tf.Module):
         with tf.GradientTape() as tape:
             theta = self( states )
             huber_loss = self.quantile_huber_loss( target, theta, actions ) * we
-            loss = tf.reduce_mean( huber_loss )            
-            l2_loss = ( 
+            loss = tf.reduce_mean( huber_loss )
+            l2_loss = (
                 tf.nn.l2_loss( self.fc1.weights[0] )
                 + tf.nn.l2_loss( self.fc1.weights[1] )
                 + tf.nn.l2_loss( self.fc2.weights[0] )
                 + tf.nn.l2_loss( self.fc2.weights[1] )
                 + tf.nn.l2_loss( self.fc3.weights[0] )
-                + tf.nn.l2_loss( self.fc3.weights[1] ) 
+                + tf.nn.l2_loss( self.fc3.weights[1] )
             )
             t_loss = loss + ( 2e-6 * l2_loss )
             
@@ -178,6 +183,433 @@ class QRNetwork(tf.Module):
         self.train_l2_loss( l2_loss )
 
         return huber_loss, tf.reduce_mean( theta, axis = -1 )
+
+
+class SimplePPONetwork(tf.Module):
+
+    def __init__(self, action_dim, name, lr, train=False):
+        
+        super(SimplePPONetwork, self).__init__()
+        
+        self.module_type = 'PPO'
+
+        self.action_dim = action_dim
+        
+        # actor
+        self.a_fc1 = dense( 512, 'a', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.a_fc2 = dense( 256, 'a', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.a_fc3 = dense( 64, 'a', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.act = dense( action_dim, 'a', activation = softmax )
+
+        # critic
+        self.c_fc1 = dense( 512, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc2 = dense( 256, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc3 = dense( 64, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.val = dense( 1, 'c', activation = lambda x : x )
+
+        self.log_dir = 'logs/ppo_{}'.format(name)
+
+        self.a_optimizer = Adam( tf.Variable( lr ) )
+        self.c_optimizer = Adam( tf.Variable( lr ) )
+
+        run_number = 0
+        while os.path.exists(self.log_dir + str(run_number)):
+            run_number += 1
+        self.log_dir = self.log_dir + str(run_number)
+        self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
+        
+        self.a_loss = tf.keras.metrics.Mean( 'a_loss', dtype = tf.float32 )
+        self.c_loss = tf.keras.metrics.Mean( 'c_loss', dtype = tf.float32 )
+        self.reward = tf.keras.metrics.Mean( 'reward', dtype = tf.float32 )
+
+    def probs(self, states):
+
+        x = self.a_fc1( states )
+        x = self.a_fc2( x )
+        x = self.a_fc3( x )
+        probs = self.act( x )
+
+        return probs
+
+    def value(self, states):
+
+        x = self.c_fc1( states )
+        x = self.c_fc2( x )
+        x = self.c_fc3( x )
+        values = self.val( x )
+
+        return values
+
+    def __call__(self, states):
+
+        self.probs( states )
+        self.value( states )
+
+    def ppo_loss(self, advantages, prediction_picks, actions, y_pred):
+        
+        # Defined in https://arxiv.org/abs/1707.06347
+        
+        LOSS_CLIPPING = 0.2
+        ENTROPY_LOSS = 0.001
+        
+        prob = actions * y_pred
+        old_prob = actions * prediction_picks
+
+        prob = tf.clip_by_value( prob, 1e-10, 1.0 )
+        old_prob = tf.cast( tf.clip_by_value( old_prob, 1e-10, 1.0 ), tf.float32 )
+
+        ratio = tf.math.exp( tf.math.log( prob ) - tf.math.log( old_prob ) )
+        
+        p1 = ratio * advantages
+        p2 = tf.clip_by_value( ratio, 1 - LOSS_CLIPPING, 1 + LOSS_CLIPPING ) * advantages
+
+        actor_loss = -tf.reduce_mean( tf.minimum( p1, p2 ) )
+
+        entropy = -( y_pred * tf.math.log( y_pred + 1e-10 ) )
+        entropy = ENTROPY_LOSS * tf.reduce_mean( entropy )
+        
+        total_loss = actor_loss - entropy
+
+        return total_loss
+
+    def critic_PPO2_loss(self, values, y_true, y_pred):
+        
+        LOSS_CLIPPING = 0.2
+        clipped_value_loss = values + tf.clip_by_value( y_pred - values, -LOSS_CLIPPING, LOSS_CLIPPING )
+        v_loss1 = ( y_true - clipped_value_loss ) ** 2
+        v_loss2 = ( y_true - y_pred ) ** 2
+        
+        value_loss = 0.5 * tf.reduce_mean( tf.maximum( v_loss1, v_loss2 ) )
+        #value_loss = K.mean((y_true - y_pred) ** 2) # standard PPO loss
+        return value_loss
+
+    def train(self, states, values, target, advantages, predictions, actions, rewards, epochs, shuffle):
+
+        a_vars = [ v for v in self.trainable_variables if 'a_' in v.name ]
+        c_vars = [ v for v in self.trainable_variables if 'c_' in v.name ]
+
+        for e in range( epochs ):
+
+            with tf.GradientTape() as tape_c:
+                c_pred = self.value( states )
+                c_loss = self.critic_PPO2_loss( values, target, c_pred )
+            c_gradients = tape_c.gradient( c_loss, c_vars )
+            self.c_optimizer.apply_gradients( zip( c_gradients, c_vars ) )
+            self.c_loss( c_loss )
+
+            with tf.GradientTape() as tape_a:
+                a_pred = self.probs( states )
+                a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
+            a_gradients = tape_a.gradient( a_loss, a_vars )
+            self.a_optimizer.apply_gradients( zip( a_gradients, a_vars ) )
+            self.a_loss( a_loss )
+
+        self.reward( tf.reduce_mean( rewards ) )
+
+
+class NaluPPONetwork(tf.Module):
+
+    def __init__(self, action_dim, name, lr, train=False):
+        
+        super(NaluPPONetwork, self).__init__()
+        
+        self.module_type = 'NaluPPO'
+
+        self.action_dim = action_dim
+        
+        # actor
+        self.a_fc1 = nalu_transform( 512, name = 'a', activation = tanh, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.a_fc2 = dense( 256, 'a', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.a_fc3 = dense( 64, 'a', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.act = dense( action_dim, 'a', activation = softmax )
+
+        # critic
+        self.c_fc1 = nalu_transform( 512, name = 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc2 = dense( 256, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc3 = dense( 64, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.val = dense( 1, 'c', activation = lambda x : x )
+
+        self.log_dir = 'logs/nalu_ppo_{}'.format(name)
+
+        self.a_optimizer = Adam( tf.Variable( lr ) )
+        self.c_optimizer = Adam( tf.Variable( lr ) )
+
+        run_number = 0
+        while os.path.exists(self.log_dir + str(run_number)):
+            run_number += 1
+        self.log_dir = self.log_dir + str(run_number)
+        self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
+        
+        self.a_loss = tf.keras.metrics.Mean( 'a_loss', dtype = tf.float32 )
+        self.c_loss = tf.keras.metrics.Mean( 'c_loss', dtype = tf.float32 )
+        self.reward = tf.keras.metrics.Mean( 'reward', dtype = tf.float32 )
+
+    def probs(self, states):
+
+        x = self.a_fc1( states )
+        x = self.a_fc2( x )
+        x = self.a_fc3( x )
+        probs = self.act( x )
+
+        return probs
+
+    def value(self, states):
+
+        x = self.c_fc1( states )
+        x = self.c_fc2( x )
+        x = self.c_fc3( x )
+        values = self.val( x )
+
+        return values
+
+    def __call__(self, states):
+
+        self.probs( states )
+        self.value( states )
+
+    def ppo_loss(self, advantages, prediction_picks, actions, y_pred):
+        
+        # Defined in https://arxiv.org/abs/1707.06347
+        
+        LOSS_CLIPPING = 0.2
+        ENTROPY_LOSS = 0.001
+        
+        prob = actions * y_pred
+        old_prob = actions * prediction_picks
+
+        prob = tf.clip_by_value( prob, 1e-10, 1.0 )
+        old_prob = tf.cast( tf.clip_by_value( old_prob, 1e-10, 1.0 ), tf.float32 )
+
+        ratio = tf.math.exp( tf.math.log( prob ) - tf.math.log( old_prob ) )
+        
+        p1 = ratio * advantages
+        p2 = tf.clip_by_value( ratio, 1 - LOSS_CLIPPING, 1 + LOSS_CLIPPING ) * advantages
+
+        actor_loss = -tf.reduce_mean( tf.minimum( p1, p2 ) )
+
+        entropy = -( y_pred * tf.math.log( y_pred + 1e-10 ) )
+        entropy = ENTROPY_LOSS * tf.reduce_mean( entropy )
+        
+        total_loss = actor_loss - entropy
+
+        return total_loss
+
+    def critic_PPO2_loss(self, values, y_true, y_pred):
+        
+        LOSS_CLIPPING = 0.2
+        clipped_value_loss = values + tf.clip_by_value( y_pred - values, -LOSS_CLIPPING, LOSS_CLIPPING )
+        v_loss1 = ( y_true - clipped_value_loss ) ** 2
+        v_loss2 = ( y_true - y_pred ) ** 2
+        
+        value_loss = 0.5 * tf.reduce_mean( tf.maximum( v_loss1, v_loss2 ) )
+        #value_loss = K.mean((y_true - y_pred) ** 2) # standard PPO loss
+        return value_loss
+
+    def train(self, states, values, target, advantages, predictions, actions, rewards, epochs, shuffle):
+
+        a_vars = [ v for v in self.trainable_variables if 'a/' in v.name or 'a_' in v.name ]
+        c_vars = [ v for v in self.trainable_variables if 'c/' in v.name or 'c_' in v.name ]
+
+        for e in range( epochs ):
+
+            with tf.GradientTape() as tape_c:
+                c_pred = self.value( states )
+                c_loss = self.critic_PPO2_loss( values, target, c_pred )
+            c_gradients = tape_c.gradient( c_loss, c_vars )
+            self.c_optimizer.apply_gradients( zip( c_gradients, c_vars ) )
+            self.c_loss( c_loss )
+
+            with tf.GradientTape() as tape_a:
+                a_pred = self.probs( states )
+                a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
+            a_gradients = tape_a.gradient( a_loss, a_vars )
+            self.a_optimizer.apply_gradients( zip( a_gradients, a_vars ) )
+            self.a_loss( a_loss )
+
+        self.reward( tf.reduce_mean( rewards ) )
+
+
+class NaluAdavancedPPONetwork(tf.Module):
+
+    def __init__(self, action_dim, name, lr, train=False):
+        
+        super(NaluAdavancedPPONetwork, self).__init__()
+        
+        self.module_type = 'NaluAPPO'
+
+        self.action_dim = action_dim
+
+        # base
+        self.b_fc1 = nalu_transform( 512, name = 'b', activation = tanh, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.b_fc2 = dense( 256, name = 'b', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        
+        # actor
+        self.a_fc1 = dense( 64, 'a', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.act = dense( action_dim, 'a', activation = softmax )
+
+        # critic
+        self.c_fc1 = dense( 64, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.val = dense( 1, 'c', activation = lambda x : x )
+
+        self.log_dir = 'logs/nalu_a_ppo_{}'.format(name)
+
+        self.lr = tf.keras.optimizers.schedules.ExponentialDecay( lr, 1000, 0.96, staircase=False, name=None )
+        # self.optimizer = Adam( self.lr )#.get_mixed_precision()
+
+        self.b_optimizer = Adam( self.lr )
+        self.a_optimizer = Adam( self.lr )
+        self.c_optimizer = Adam( self.lr )
+
+        run_number = 0
+        while os.path.exists(self.log_dir + str(run_number)):
+            run_number += 1
+        self.log_dir = self.log_dir + str(run_number)
+        self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
+        
+        self.a_loss = tf.keras.metrics.Mean( 'a_loss', dtype = tf.float32 )
+        self.c_loss = tf.keras.metrics.Mean( 'c_loss', dtype = tf.float32 )
+        self.reward = tf.keras.metrics.Mean( 'reward', dtype = tf.float32 )
+
+    def base(self, states):
+
+        x = self.b_fc1( states )
+        x = self.b_fc2( x )
+
+        return x
+
+    def probs(self, states):
+        
+        x = self.base( states )
+        x = self.a_fc1( x )
+        probs = self.act( x )
+
+        return probs
+
+    def value(self, states):
+
+        x = self.base( states )
+        x = self.c_fc1( x )
+        values = self.val( x )
+
+        return values
+
+    def __call__(self, states):
+
+        x = self.b_fc1( states )
+        x = self.b_fc2( x )
+
+        xa = self.a_fc1( x )
+        probs = self.act( xa )
+
+        xc = self.c_fc1( x )
+        values = self.val( xc )
+
+        return probs, values
+
+    def ppo_loss(self, advantages, prediction_picks, actions, y_pred):
+        
+        # Defined in https://arxiv.org/abs/1707.06347
+        
+        LOSS_CLIPPING = 0.2
+        ENTROPY_LOSS = 0.001
+        
+        prob = actions * y_pred
+        old_prob = actions * prediction_picks
+
+        prob = tf.clip_by_value( prob, 1e-10, 1.0 )
+        old_prob = tf.cast( tf.clip_by_value( old_prob, 1e-10, 1.0 ), tf.float32 )
+
+        ratio = tf.math.exp( tf.math.log( prob ) - tf.math.log( old_prob ) )
+        
+        p1 = ratio * advantages
+        p2 = tf.clip_by_value( ratio, 1 - LOSS_CLIPPING, 1 + LOSS_CLIPPING ) * advantages
+
+        actor_loss = -tf.reduce_mean( tf.minimum( p1, p2 ) )
+
+        entropy = -( y_pred * tf.math.log( y_pred + 1e-10 ) )
+        entropy = ENTROPY_LOSS * tf.reduce_mean( entropy )
+        
+        total_loss = actor_loss - entropy
+
+        return total_loss
+
+    def critic_PPO2_loss(self, values, y_true, y_pred):
+        
+        LOSS_CLIPPING = 0.2
+        clipped_value_loss = values + tf.clip_by_value( y_pred - values, -LOSS_CLIPPING, LOSS_CLIPPING )
+        v_loss1 = ( y_true - clipped_value_loss ) ** 2
+        v_loss2 = ( y_true - y_pred ) ** 2
+        
+        value_loss = 0.5 * tf.reduce_mean( tf.maximum( v_loss1, v_loss2 ) )
+        # value_loss = K.mean((y_true - y_pred) ** 2) # standard PPO loss
+        return value_loss
+
+    def train(self, states, values, target, advantages, predictions, actions, rewards, epochs, shuffle):
+
+        b_vars = [ v for v in self.trainable_variables if 'b/' in v.name or 'b_' in v.name ]
+        a_vars = b_vars + [ v for v in self.trainable_variables if 'a/' in v.name or 'a_' in v.name ]
+        c_vars = b_vars + [ v for v in self.trainable_variables if 'c/' in v.name or 'c_' in v.name ]
+
+        for e in range( epochs ):
+            
+            #######################################################################
+            # with tf.GradientTape() as tape:
+                
+            #     a_pred, c_pred = self( states )
+            #     c_loss = self.critic_PPO2_loss( values, target, c_pred )
+            #     a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
+            #     # b_loss = self.optimizer.get_scaled_loss( a_loss + c_loss )
+            #     b_loss = a_loss + c_loss
+            
+            # gradients = tape.gradient( b_loss, self.trainable_variables )
+            # self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
+
+            # gradients = self.optimizer.get_unscaled_gradients( tape.gradient( b_loss, self.trainable_variables ) )
+            # self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
+
+            ######################################################################
+            with tf.GradientTape() as tape_c, tf.GradientTape() as tape_a:
+                
+                a_pred, c_pred = self( states )
+
+                c_loss = self.critic_PPO2_loss( values, target, c_pred )
+                a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
+
+            a_gradients = tape_a.gradient( a_loss, a_vars )
+            c_gradients = tape_c.gradient( c_loss, c_vars )
+            b_gradients = [ 0.5 * g1 + 0.5 * g2 for g1, g2 in zip( a_gradients[0:len(b_vars)], a_gradients[0:len(b_vars)] ) ]
+            
+            self.b_optimizer.apply_gradients( zip( b_gradients, b_vars ) )
+            self.a_optimizer.apply_gradients( zip( a_gradients[len(b_vars):], a_vars[len(b_vars):] ) )
+            self.c_optimizer.apply_gradients( zip( c_gradients[len(b_vars):], c_vars[len(b_vars):] ) )
+
+            #######################################################################
+            # with tf.GradientTape() as tape_b:                
+            #     a_pred, c_pred = self( states )
+            #     c_loss = self.critic_PPO2_loss( values, target, c_pred )
+            #     a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
+            #     b_loss = 0.5 * a_loss + 0.5 * c_loss
+
+            # with tf.GradientTape() as tape_a:                
+            #     a_pred = self.probs( states )
+            #     a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
+
+            # with tf.GradientTape() as tape_c:                
+            #     c_pred = self.value( states )
+            #     c_loss = self.critic_PPO2_loss( values, target, c_pred )
+
+            # b_gradients = tape_b.gradient( b_loss, b_vars )
+            # a_gradients = tape_a.gradient( a_loss, a_vars )
+            # c_gradients = tape_c.gradient( c_loss, c_vars )
+            
+            # self.b_optimizer.apply_gradients( zip( b_gradients, b_vars ) )
+            # self.a_optimizer.apply_gradients( zip( a_gradients, a_vars ) )
+            # self.c_optimizer.apply_gradients( zip( c_gradients, c_vars ) )
+            
+            self.c_loss( c_loss )
+            self.a_loss( a_loss )
+        
+        self.reward( tf.reduce_mean( rewards ) )
 
 
 class NALUQRNetwork(tf.Module):
@@ -192,20 +624,15 @@ class NALUQRNetwork(tf.Module):
         self.atoms = atoms
         self.log = log
         self.action_dim = action_dim
-        self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
         
-        self.fc1 = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc2 = nalu( f2, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc3 = nalu( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
-
-        self.dp1 = tf.keras.layers.Dropout( .25 )
-        self.dp2 = tf.keras.layers.Dropout( .25 )
+        self.su = StateUnderstanding( state_dim, f1, f1, train )
+        self.ac = Actorv2( f2, action_dim, f2, atoms, train )
 
         self.log_dir = 'logs/nqrnet_{}'.format(name)
 
         if train:
 
-            self.optimizer = Adam( tf.Variable( 2e-4 ) )
+            self.optimizer = Adam( tf.Variable( 2e-4 ), amsgrad = False )# .get_mixed_precision()
             
             if self.log:
                 run_number = 0
@@ -215,112 +642,367 @@ class NALUQRNetwork(tf.Module):
                 self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
         
         self.train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
-        self.train_l2_loss = tf.keras.metrics.Mean('train_l2_loss', dtype=tf.float32)
         self.reward = tf.keras.metrics.Mean('reward', dtype=tf.float32)
-        self.actions = [ tf.keras.metrics.Mean('act_{}'.format(x), dtype=tf.float32) for x in range(action_dim) ]
     
-    def __call__(self, states):
+    def __call__(self, states, eval=True):
         
         """Build a network that maps state -> action values."""
         
-        x = states
-        x = self.fc1( x )
-        if self.log: x = self.dp1( x )
-        x = self.fc2( x )
-        if self.log: x = self.dp2( x )
-        
-        return tf.reshape( self.fc3( x ), [ -1, self.action_dim, self.atoms ] )
+        # State Understanding
+        s = self.su( states, eval = eval )
+        ac, tau = self.ac( s, eval = eval )
 
-    def quantile_huber_loss(self, target, pred, actions):
-        
-        pred = tf.reduce_sum( pred * tf.expand_dims( actions, -1 ), axis = 1 )
-        pred_tile = tf.tile( tf.expand_dims( pred, axis = 2 ), [ 1, 1, self.atoms ] )
-        
-        target_tile = tf.cast( tf.tile( tf.expand_dims( target, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
-        
-        # huber_loss = tf.math.square( pred_tile - target_tile )
-        huber_loss = tf.compat.v1.losses.huber_loss( target_tile, pred_tile, reduction = tf.keras.losses.Reduction.NONE )
-        
-        tau = tf.cast( tf.reshape( np.array( self.tau ), [ 1, self.atoms ] ), tf.float32 )
-        inv_tau = tf.cast( 1.0 - tau, tf.float32 )
-        tau = tf.cast( tf.tile( tf.expand_dims( tau, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
-        inv_tau = tf.cast( tf.tile( tf.expand_dims( inv_tau, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
-        
-        error_loss = tf.math.subtract( target_tile, pred_tile )
-        loss = tf.where( tf.less( error_loss, 0.0 ), inv_tau * huber_loss, tau * huber_loss )
-        loss = tf.reduce_sum( tf.reduce_mean( loss, axis = 2 ), axis = 1 )
-        
-        return loss
+        if eval:
+            return ac, tau
+        else:
+            return ac, tau, s
 
-    def train(self, states, target, actions, we, step, bs):
+    def train(self, states, target, actions, w):
 
         with tf.GradientTape() as tape:
-            theta = self( states )
-            huber_loss = self.quantile_huber_loss( target, theta, actions ) * we
-            loss = tf.reduce_mean( huber_loss )            
-            l2_loss = ( 
-                  tf.nn.l2_loss( self.fc1.weights[3] )
-                + tf.nn.l2_loss( self.fc1.weights[5] )
-                + tf.nn.l2_loss( self.fc2.weights[3] )
-                + tf.nn.l2_loss( self.fc2.weights[5] )
-                + tf.nn.l2_loss( self.fc3.weights[3] )
-                + tf.nn.l2_loss( self.fc3.weights[5] ) 
-            )
-            t_loss = loss # + ( 2e-6 * l2_loss )
             
-        gradients = tape.gradient( t_loss, self.trainable_variables )
+            theta, tau, s = self( states, eval = False )
+            
+            huber_loss = self.ac.quantile_huber_loss( target, theta, actions, tau )
+            # loss = tf.reduce_mean( huber_loss * w )
+            loss = tf.reduce_mean( huber_loss )
+                    
+        gradients = tape.gradient( loss, self.trainable_variables )
+        
         self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
 
         self.train_loss( loss )
-        self.train_l2_loss( l2_loss )
 
-        return huber_loss, tf.reduce_mean( theta, axis = -1 )
+        return huber_loss, tf.reduce_mean( theta, axis = -1 ), loss
 
 
-class AGNNALUQRNetwork2(tf.Module):
+class NALUQRMultiNetwork(tf.Module):
 
-    def __init__(self, state_dim, action_dim, name, f1, f2, atoms, train=False, log=False):
+    def __init__(self, envs, name, f1, f2, atoms, maxlen, train=False):
         
-        super(AGNNALUQRNetwork2, self).__init__()
+        super(NALUQRMultiNetwork, self).__init__()
         
-        self.module_type = 'AGNNALUQRNet'
+        self.module_type = 'NQRNet'
 
-        self.to_train = train
-        self.atoms = atoms
-        self.log = log
         self.f1 = f1
         self.f2 = f2
-        self.ag_in_size = 16
-        self.ag_out_size = action_dim * self.atoms
-        self.action_dim = action_dim
-        self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
+        self.atoms = atoms
         
-        self.fc1 = nalu( f1, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc2 = nalu( f2, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc3 = nalu( f2, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.su = StateUnderstandingMultiEnv_v3( envs, f1, f1, maxlen )
+        # self.ac = ActorMultiEnv_v2( envs, f2, atoms )
+        self.ac = { x['id']: FakeActor( f2, x['action_dim'], atoms ) for x in envs }
 
-        self.dp1 = tf.keras.layers.Dropout( .25 )
-        self.dp2 = tf.keras.layers.Dropout( .25 )
+        self.wa = tf.Variable( tf.random.normal( [ 4, f1 ] ), name = "self_w_a", trainable = True )
+        self.self_learning = dense( 8 )
+        self.self_learning( tf.zeros( [ 1, 1, f1 ] ) )
 
-        aux1 = self.ag_out_size
-        aux2 = f2
-        dvs = [ 0 ]
-        w = np.zeros( [ f2, self.ag_out_size ] )
-        for i in range( self.ag_out_size ):
-            dv = aux2 / aux1
-            v = ceil( dv ) if dv - int( dv ) > .5 else int( dv )
-            w[ np.sum( dvs ) : np.sum( dvs ) + v, i ] = ( 1 / v )
-            dvs.append( v )
-            aux1 -= 1
-            aux2 -= v
-
-        self.aw = tf.cast( tf.convert_to_tensor( w ), tf.float32 )
-
-        self.log_dir = 'logs/agnnaluqrnet_{}'.format(name)
+        self.log_dir = 'logs/nqrnet_{}'.format(name)
 
         if train:
 
-            self.optimizer = Adam( tf.Variable( 2e-4 ) )
+            self.optimizer = Adam( tf.Variable( 2e-4 ) ).get_mixed_precision()
+            
+            self.reduce = lambda loss : tf.reduce_mean( tf.reduce_mean( loss, axis = 1 ) )
+                
+            run_number = 0
+            
+            # while os.path.exists(self.log_dir + str(run_number)): run_number += 1
+            self.log_dir = self.log_dir + str(run_number)
+
+            self.train_summary_writer_total = tf.summary.create_file_writer( '{}'.format( self.log_dir ) )
+
+            self.train_summary_writer = {}
+            self.train_loss = {}
+            self.train_l2_loss = {}
+            self.reward = {}
+            for e in envs:
+                self.train_summary_writer[e['id']] = tf.summary.create_file_writer( '{}_{}'.format( self.log_dir, e['name'] + '_' + e['id'] ) )
+                self.train_loss[e['id']] = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
+                self.reward[e['id']] = tf.keras.metrics.Mean('reward', dtype=tf.float32)
+    
+    def __call__(self, states, env, past=None, eval=True):
+        
+        """Build a network that maps state -> action values."""
+        
+        # State Understanding
+        s, past, mask, vls = self.su( states, None, env, past, eval = eval )
+        ac, _ = self.ac[env]( s, env )
+
+        if eval:
+            return ac, past, mask
+        else:
+            return ac, past, mask, vls
+
+    def train(self, states, target, actions, next_states, t_masks, envs):
+        
+        ls = {}
+        ls_self = {}
+        masks = {}
+        thetas = {}
+        loses = 0
+        su_values = [
+            tf.zeros( [ 8 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+        ]
+
+        with tf.GradientTape() as tape:
+            
+            for e in envs:
+                            
+                # compute loss for each env
+                theta, _, mask, vls = self( states[e], e, eval = False )
+                huber_loss = self.ac[e].quantile_huber_loss( target[e], theta, actions[e] ) * t_masks[e]
+                loss1 = self.reduce( huber_loss )
+
+                # compute next state
+                acs = tf.gather( self.wa, tf.cast( actions[e], tf.int32 ) )
+                next_state_predict = self.self_learning( vls[3] + acs )
+                loss2 = self.reduce( tf.keras.losses.huber( next_states[e], next_state_predict ) )
+
+                loss = loss1 + loss2
+                
+                self.train_loss[e]( loss )
+                ls[e] = loss1
+                ls_self[e] = loss2
+                masks[e] = mask
+                thetas[e] = theta
+                
+                loses += loss
+                
+                su_values = [ x1 + tf.reduce_mean( tf.reduce_mean( x2, axis = 0 ), axis = 0 ) for x1, x2 in zip( su_values, vls ) ]
+
+            # compute l2 loss
+            l2_loss = \
+                tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.su.weights ] )
+            
+            loses += ( 2e-6 * l2_loss )
+
+            scaled_loss = self.optimizer.get_scaled_loss( loses )
+                
+        grads = self.optimizer.get_unscaled_gradients( tape.gradient( scaled_loss, self.trainable_variables ) )
+        self.optimizer.apply_gradients( zip( grads, self.trainable_variables ) )
+
+        return ls, ls_self, masks, thetas, [ x1 / len( envs ) for x1 in su_values ]
+
+    def train2(self, states, target, actions, t_masks, envs):
+        
+        ls = {}
+        masks = {}
+        thetas = {}
+        grads = [ tf.zeros_like( x ) for x in self.trainable_variables ]
+        su_values = [
+            tf.zeros( [ 8 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+            tf.zeros( [ self.f1 ] ),
+        ]
+        for e in envs:
+            
+            with tf.GradientTape() as tape:
+                
+                # compute loss for each env
+                theta, _, mask, vls = self( states[e], e, eval = False )
+                huber_loss = self.ac[e].quantile_huber_loss( target[e], theta, actions[e] ) * t_masks[e]
+                loss = self.reduce( huber_loss )
+                self.train_loss[e]( loss )
+                ls[e] = loss
+                masks[e] = mask
+                thetas[e] = theta
+
+                # compute l2 loss
+                l2_loss = \
+                    tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.su.weights ] ) +\
+                    tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.ac[e].weights ] )
+                
+                tloss = loss + ( 1e-5 * l2_loss )
+                scaled_loss = self.optimizer.get_scaled_loss( tloss )
+
+                su_values = [ x1 + tf.reduce_mean( tf.reduce_mean( x2, axis = 0 ), axis = 0 ) for x1, x2 in zip( su_values, vls ) ]
+                
+            grad = self.optimizer.get_unscaled_gradients( tape.gradient( scaled_loss, self.trainable_variables ) )
+            for i, ( g, v ) in enumerate( zip( grad, self.trainable_variables ) ):                
+                if g is None: continue                
+                if 'su_recurrent' in v.name:        g = g * self.su.envs[e]['recurrent']
+                elif 'su_non_recurrent' in v.name:  g = g * ( 1 - self.su.envs[e]['recurrent'] )
+                grads[i] += g
+
+        self.optimizer.apply_gradients( zip( grads, self.trainable_variables ) )
+
+        return ls, masks, thetas, [ x1 / len( envs ) for x1 in su_values ]
+
+  
+class MNALUQRNetwork(tf.Module):
+
+    def __init__(self, name,
+        state_dim, sf1, sf2, # state understanding
+        m_hsize, m, n, max_size, num_blocks, n_read, n_att_heads, lr, decay, # global memory
+        fc1, fc2, # feature creator
+        action_dim, df1, atoms, # actor and critic
+        train=False):
+        
+        super(MNALUQRNetwork, self).__init__()
+        
+        self.module_type = 'MNQRNet'
+
+        self.to_train = train
+        self.atoms = atoms
+        self.action_dim = action_dim
+
+        self.su = StateUnderstanding( state_dim, sf1, sf2, train )
+        self.gm = GlobalMemory( action_dim, m_hsize, m, n, 64, max_size, num_blocks, n_read, n_att_heads, lr, decay, train )
+        self.fc = FeatureCreator( fc1, fc2, train )
+        self.ac = Actor( df1, action_dim, atoms, train )
+        self.cr = Critic( atoms, train )
+
+        self.log_dir = 'logs/mnqrnet_{}'.format(name)
+
+        self.optimizer = Adam( tf.Variable( 2e-4 ) )
+
+        self.a_train_loss = tf.keras.metrics.Mean('a_train_loss', dtype=tf.float32)
+        self.c_train_loss = tf.keras.metrics.Mean('c_train_loss', dtype=tf.float32)
+
+        self.train_l2_loss = tf.keras.metrics.Mean('train_l2_loss', dtype=tf.float32)
+
+        self.reward = tf.keras.metrics.Mean('reward', dtype=tf.float32)
+        self.actions = [ tf.keras.metrics.Mean('act_{}'.format(x), dtype=tf.float32) for x in range(action_dim) ]
+
+        if train:
+
+            # p = [ int( i >= max_size // 2 ) for i in range( 0, max_size ) ]
+            # self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss * p, axis = 1 ) )
+            self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss, axis = 1 ) )
+            
+            run_number = 0
+            while os.path.exists(self.log_dir + str(run_number)):
+                run_number += 1
+            self.log_dir = self.log_dir + str(run_number)
+            self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
+    
+    def reset(self, bs):
+        return self.gm.reset( bs )
+
+    def __call__(self, state, _state, action, reward, done, x_w, gparams, step, gpast=None):
+        
+        """Build a network that maps state -> action values."""
+
+        # State Understanding
+        s, ps = self.su( state, _state )
+        
+        # Global Memory        
+        y, p_state, mask = self.gm( tf.stop_gradient( s ), tf.stop_gradient( ps ), action, reward, done, x_w, step, gparams, gpast )
+        gpresent, *gparams = p_state
+
+        # Feature Creator
+        h = self.fc( s, tf.stop_gradient( y ) )
+        
+        # Actor
+        ac, h_ac = self.ac( h )
+
+        # Critic
+        c = self.cr( tf.stop_gradient( s ), tf.stop_gradient( h_ac ), y )
+
+        return ac, c, gpresent, gparams, mask
+
+    def train(self, states, _states, actions, x_ws, steps, gparams, ac_target, cr_target, at, rt, dt):
+        
+        # bs, s, *_ = states.shape.as_list()
+        # sts = tf.stack( [ tf.range( start = steps[b,0], limit = steps[b,0] + s, dtype = tf.float32 ) for b in range( bs ) ], axis = 0 )
+        with tf.GradientTape() as tape:
+            
+            a_theta, c_theta, _, _, msk = self( states, _states, at, rt, dt, x_ws, gparams, steps )
+            
+            # a ideia é aprender conforme o lr da memoria diminua
+            cr_huber_loss = self.cr.quantile_huber_loss( cr_target, c_theta ) # * tf.stop_gradient( ( 1 - self.gm.memory.memory.alpha( sts ) ) )
+            
+            # aprende apos o critico saber extrair a recompensa da memoria
+            #c_rate = tf.reduce_mean( tf.square( cr_target - c_theta ), axis = -1 ) 
+            ac_huber_loss = self.ac.quantile_huber_loss( ac_target, a_theta, actions ) # * tf.stop_gradient( ( 1 - tf.clip_by_value( c_rate, 0, 1 ) ) )
+
+            al = self.reduce( ac_huber_loss )
+            cl = self.reduce( cr_huber_loss )
+            loss =  al + cl 
+            
+            l2_loss =\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.su.trainable_variables ] ) +\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.gm.trainable_variables ] ) +\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.fc.trainable_variables ] ) +\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.ac.trainable_variables ] ) +\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.cr.trainable_variables ] ) 
+            
+            t_loss = loss + ( 2e-5 * l2_loss )
+            
+        gradients = tape.gradient( t_loss, self.trainable_variables )
+
+        self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
+
+        self.a_train_loss( al )
+        self.c_train_loss( cl )
+
+        self.train_l2_loss( 2e-5 * l2_loss )
+
+        return loss, a_theta, c_theta, msk
+
+
+class NALUQRPNetwork(tf.Module):
+
+    def __init__(self, state_dim, action_dim, name, f1, f2, quantile_dim, atoms, entropy_beta, train=False, log=False):
+        
+        super(NALUQRPNetwork, self).__init__()
+        
+        self.module_type = 'NQRPNet'
+
+        self.to_train = train
+        self.atoms = atoms
+        self.quantile_dim = quantile_dim
+        self.log = log
+        self.action_dim = action_dim
+        self.entropy_beta = entropy_beta
+        
+        # base
+        self.b_fc1 = nalu_transform( f1, activation = elu, kernel_initializer = truncated_normal(), name = 'b_su1' )
+        self.b_fc2 = nalu_transform( f2, activation = elu, kernel_initializer = truncated_normal(), name = 'b_su2' )
+
+        self.b_dp1 = tf.keras.layers.Dropout( .25 )
+        self.b_dp2 = tf.keras.layers.Dropout( .25 )
+
+        # critic
+        self.c_embeding = tf.Variable( tf.random.normal( [ action_dim, f2 ] ), trainable = True, name = 'c_embeding', dtype = tf.float32 )
+        self.c_fc1 = dense( quantile_dim, activation = elu, kernel_initializer = random_normal(), name = 'c' )
+        self.c_fc2 = dense( quantile_dim, activation = elu, kernel_initializer = random_normal(), name = 'c' )
+
+        self.c_phi = dense( quantile_dim, kernel_initializer = random_normal(), bias = False, name = 'c' )
+        self.c_phi_bias = tf.cast( tf.Variable( tf.zeros( quantile_dim ) ), tf.float32 )
+        self.c_fc = dense( f2, kernel_initializer = random_normal(), activation = elu, name = 'c' )
+        self.c_fc_q = dense( 1, kernel_initializer = random_normal(), name = 'c' )
+        
+        self.c_dp1 = tf.keras.layers.Dropout( .25 )
+        self.c_dp2 = tf.keras.layers.Dropout( .25 )
+
+        # actor
+        self.a_fc1 = dense( f2, activation = elu, kernel_initializer = orthogonal(), name = 'a' )
+        self.a_fc2 = dense( f2, activation = elu, kernel_initializer = orthogonal(), name = 'a' )
+        self.a_act = dense( action_dim, activation = lambda x:x, kernel_initializer = orthogonal(), name = 'a' )
+
+        self.a_dp1 = tf.keras.layers.Dropout( .25 )
+        self.a_dp2 = tf.keras.layers.Dropout( .25 )
+
+        self.log_dir = 'logs/nqrpnet_{}'.format(name)
+
+        if train:
+
+            self.optimizer_b = Adam( tf.Variable( 5e-4 ) )
+            self.optimizer_c = Adam( tf.Variable( 5e-4 ) )
+            self.optimizer_a = Adam( tf.Variable( 1e-3 ) )
             
             if self.log:
                 run_number = 0
@@ -329,188 +1011,232 @@ class AGNNALUQRNetwork2(tf.Module):
                 self.log_dir = self.log_dir + str(run_number)
                 self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
         
-        self.train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
-        self.train_l2_loss = tf.keras.metrics.Mean('train_l2_loss', dtype=tf.float32)
+        self.train_actor_loss = tf.keras.metrics.Mean('train_actor_loss', dtype=tf.float32)
+        self.train_critic_loss = tf.keras.metrics.Mean('train_critic_loss', dtype=tf.float32)
         self.reward = tf.keras.metrics.Mean('reward', dtype=tf.float32)
-        self.actions = [ tf.keras.metrics.Mean('act_{}'.format(x), dtype=tf.float32) for x in range(action_dim) ]
-      
-    def __call__(self, states):
-        
-        """Build a network that maps state -> action values."""
-                
-        x = states
-        x = self.fc1( x )
-        if self.log: x = self.dp1( x )
-        x = self.fc2( x )
-        if self.log: x = self.dp2( x )
-        x = self.fc3( x )
-        x = x @ self.aw
-        
-        return tf.reshape( x, [ -1, self.action_dim, self.atoms ] )
+    
+    def base(self, states, eval=True):
 
-    def quantile_huber_loss(self, target, pred, actions):
+        x1 = self.b_fc1( states )
+        if not eval: x1 = self.b_dp1( x1 )
+        x2 = self.b_fc2( x1 )
+        if not eval: x2 = self.b_dp2( x2 )
+
+        return x2
+
+    def actor(self, base, eval=True):
+                
+        x1 = self.a_fc1( base )
+        if not eval: x1 = self.b_dp1( x1 )
+        x2 = self.a_fc2( x1 )
+        if not eval: x2 = self.b_dp2( x2 )
+
+        logits = self.a_act( x2 )
+        probs = tf.nn.softmax( logits )
+        distCat = tfp.distributions.Categorical( probs = probs )
+
+        return logits, probs, distCat
+
+    def critic(self, base, action, eval=True):
         
-        pred = tf.reduce_sum( pred * tf.expand_dims( actions, -1 ), axis = 1 )
-        pred_tile = tf.tile( tf.expand_dims( pred, axis = 2 ), [ 1, 1, self.atoms ] )
+        ac_emb = tf.gather( self.c_embeding, action )
+        h = base + ac_emb
+
+        h1 = self.c_fc1( h )
+        if not eval: h1 = self.c_dp1( h1 )
+        v = self.c_fc2( h1 )
+        if not eval: v = self.c_dp2( v )
+
+        tau = np.random.rand( self.atoms, 1 )
+        pi_mtx = tf.constant( np.expand_dims( np.pi * np.arange( 0, self.quantile_dim ), axis = 0 ) )
+        cos_tau = tf.cos( tf.matmul( tau, pi_mtx ) )
+        phi = elu( self.c_phi( cos_tau ) + tf.expand_dims( self.c_phi_bias, axis = 0 ) )
+        phi = tf.expand_dims( phi, axis = 0 )
+        x = tf.reshape( v, ( -1, v.shape[-1] ) )
+        x = tf.expand_dims( x, 1 )
+        x = x * phi
+        x = self.c_fc( x )
+        x = self.c_fc_q( x )
+        q = tf.transpose( x, [ 0, 2, 1 ] )
+
+        return q, tau
+
+    def get_action(self, states, eval=True):
         
-        target_tile = tf.cast( tf.tile( tf.expand_dims( target, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
+        base = self.base( states, eval )
         
-        # huber_loss = tf.math.square( pred_tile - target_tile )
+        logits, _, distCat = self.actor( base, eval )
+        selected_action = distCat.sample()
+        
+        return logits, selected_action
+
+    def get_real_action(self, states, eval=True):
+        base = self.base( states, eval )        
+        _, probs, _ = self.actor( base, eval )
+        selected_action = tf.argmax( probs, axis = -1 )
+        return selected_action
+
+    def get_critic(self, states, action, eval=True):
+        
+        base = self.base( states, eval )                
+        critic, tau = self.critic( base, action, eval )
+
+        return critic, tau
+
+    def __call__(self, states, action=None, eval=True):
+        
+        base = self.base( states, eval )
+        
+        logits, probs, distCat = self.actor( base, eval )
+        
+        if action is None:
+            action = distCat.sample()
+        
+        critic, tau = self.critic( base, action, eval )
+
+        return logits, probs, distCat, critic, tau
+
+    def actor_loss_a2c(self, logits, actions, adv, clip=0.1):
+
+        adv = tf.squeeze( tf.reduce_mean( adv, axis = -1 ), axis = -1 )
+
+        ce_loss = tf.keras.losses.SparseCategoricalCrossentropy( from_logits = False )
+        policy_loss = ce_loss( actions, logits, sample_weight = tf.stop_gradient( adv ) )
+        
+        return policy_loss
+
+        # adv = tf.squeeze( tf.reduce_mean( gaes, axis = -1 ), axis = -1 )
+
+        # # entropy = tf.reduce_mean( tf.math.negative( distCat.entropy() ) )
+        # # entropy *= 0.001
+
+        # log_prob = distCat.log_prob( actions )
+        # ac = tf.one_hot( actions, self.action_dim )
+        # s_old_logits = tf.reduce_sum( ac * old_logits, axis = -1 )
+
+        # ratio = tf.exp( log_prob - s_old_logits )
+
+        # clipped_ratio = tf.clip_by_value( ratio, 1 - clip, 1 + clip )
+        # surrogate = tf.math.negative( tf.minimum( ratio * adv, clipped_ratio * adv ) )
+        
+        # # surr1 = ratio * adv
+        # # surr2 = tf.clip_by_value( ratio, 1.0 - clip, 1.0 + clip ) * adv
+        # # surr = tf.minimum( surr1, surr2 )
+        # # policy_loss = tf.math.negative( tf.reduce_mean( surr ) )
+
+        # # loss = policy_loss + entropy
+       
+        # return tf.reduce_mean( surrogate )
+
+    def actor_loss_ppo2(self, old_probs, distCat, actions, adv, clip=0.1):
+
+        adv = tf.squeeze( tf.reduce_mean( adv, axis = -1 ), axis = -1 )
+
+        probs = distCat.probs
+        
+        entropy = tf.reduce_mean( tf.math.negative( distCat.entropy() ) )
+        entropy *= 0.001
+
+        log_prob = distCat.log_prob( actions )
+        ac = tf.one_hot( actions, self.action_dim )
+        s_old_log_probs = tf.reduce_sum( ac * tf.nn.log_softmax( old_probs ), axis = -1 )
+
+        ratio = tf.exp( log_prob - s_old_log_probs )
+        
+        surr1 = ratio * adv
+        surr2 = tf.clip_by_value( ratio, 1.0 - clip, 1.0 + clip ) * adv
+        surr = tf.minimum( surr1, surr2 )
+        policy_loss = tf.math.negative( tf.reduce_mean( surr ) )
+
+        loss = policy_loss + entropy
+       
+        return tf.reduce_mean( loss )
+
+    def actor_loss_ppo(self, old_probs, distCat, actions, adv, clip=0.1):
+
+        adv = tf.squeeze( tf.reduce_mean( adv, axis = -1 ), axis = -1 )
+
+        probs = distCat.probs
+        entropy = tf.reduce_mean( tf.math.negative( tf.math.multiply( probs, tf.math.log( probs ) ) ) )
+
+        ac = tf.one_hot( actions, self.action_dim )
+
+        s_old_logits = tf.reduce_sum( ac * softmax( old_probs ), axis = -1 )
+        s_probs = tf.reduce_sum( ac * distCat.probs, axis = -1 )
+
+
+        sur1 = []
+        sur2 = []
+
+        for pb, t, op in zip( s_probs, adv, s_old_logits ):
+            
+            t     = tf.constant( t )
+            op    = tf.constant( op )
+            ratio = tf.math.divide( pb, op )
+            s1    = tf.math.multiply( ratio, t )
+            s2    = tf.math.multiply( tf.clip_by_value( ratio, 1.0 - clip, 1.0 + clip ), t )
+            sur1.append(s1)
+            sur2.append(s2)
+
+        sr1 = tf.stack( sur1 )
+        sr2 = tf.stack( sur2 )
+
+        loss = tf.math.negative( tf.reduce_mean( tf.math.minimum( sr1, sr2 ) ) + 0.001 * entropy )
+               
+        return loss
+
+    def quantile_huber_loss(self, target, pred, tau):
+
+        pred_tile = tf.tile( tf.expand_dims( pred, axis = 3 ), [ 1, 1, 1, self.atoms ] )
+        target_tile = tf.cast( tf.tile( tf.expand_dims( target, axis = 2 ), [ 1, 1, self.atoms, 1 ] ), tf.float32 )
+        
         huber_loss = tf.compat.v1.losses.huber_loss( target_tile, pred_tile, reduction = tf.keras.losses.Reduction.NONE )
         
-        tau = tf.cast( tf.reshape( np.array( self.tau ), [ 1, self.atoms ] ), tf.float32 )
+        tau = tf.cast( tf.reshape( np.array( tau ), [ 1, 1, self.atoms ] ), tf.float32 )
         inv_tau = tf.cast( 1.0 - tau, tf.float32 )
-        tau = tf.cast( tf.tile( tf.expand_dims( tau, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
-        inv_tau = tf.cast( tf.tile( tf.expand_dims( inv_tau, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
+        tau = tf.cast( tf.tile( tf.expand_dims( tau, axis = 1 ), [ 1, 1, self.atoms, 1 ] ), tf.float32 )
+        inv_tau = tf.cast( tf.tile( tf.expand_dims( inv_tau, axis = 1 ), [ 1, 1, self.atoms, 1 ] ), tf.float32 )
         
         error_loss = tf.math.subtract( target_tile, pred_tile )
         loss = tf.where( tf.less( error_loss, 0.0 ), inv_tau * huber_loss, tau * huber_loss )
-        loss = tf.reduce_sum( tf.reduce_mean( loss, axis = 2 ), axis = 1 )
+        loss = tf.reduce_sum( tf.reduce_mean( loss, axis = -1 ), axis = -1 )
         
-        return loss
+        return tf.reduce_mean( tf.squeeze( loss, axis = -1 ) )
 
-    def train(self, states, target, actions, we, step, bs):
-
-        with tf.GradientTape() as tape:
-            theta = self( states )
-            huber_loss = self.quantile_huber_loss( target, theta, actions ) * we
-            loss = tf.reduce_mean( huber_loss )            
-            l2_loss = ( 
-                  tf.nn.l2_loss( self.fc1.weights[3] )
-                + tf.nn.l2_loss( self.fc1.weights[5] )
-                + tf.nn.l2_loss( self.fc2.weights[3] )
-                + tf.nn.l2_loss( self.fc2.weights[5] )
-                + tf.nn.l2_loss( self.fc3.weights[3] )
-                + tf.nn.l2_loss( self.fc3.weights[5] ) 
-            )
-            t_loss = loss + ( 2e-6 * l2_loss )
-            
-        gradients = tape.gradient( t_loss, self.trainable_variables )
-        self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
-
-        self.train_loss( loss )
-        self.train_l2_loss( l2_loss )
-
-        return huber_loss, tf.reduce_mean( theta, axis = -1 )
-
-
-class AGNNALUQRNetwork(tf.Module):
-
-    def __init__(self, state_dim, action_dim, name, f1, f2, atoms, train=False, log=False):
+    def train(self, states, target, actions, adv, old_policys):
         
-        super(AGNNALUQRNetwork, self).__init__()
+        b_vars = [ v for v in self.trainable_variables if 'b_' in v.name ]
+        a_vars = [ v for v in self.trainable_variables if 'a_' in v.name ]
+        c_vars = [ v for v in self.trainable_variables if 'c_' in v.name ]
         
-        self.module_type = 'AGNNALUQRNet'
+        with tf.GradientTape() as b_tape, tf.GradientTape() as a_tape, tf.GradientTape() as c_tape:
+        #with tf.GradientTape() as tape: 
 
-        self.to_train = train
-        self.atoms = atoms
-        self.log = log
-        self.f1 = f1
-        self.f2 = f2
-        self.ag_in_size = 16
-        self.action_dim = action_dim
-        self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
+            logits, _, distCat, critic, tau = self( states )
+            critic_loss = 0.5 * self.quantile_huber_loss( target, critic, tau )
+            actor_loss = self.actor_loss_ppo2( old_policys, distCat, actions, adv )
+            base_loss = critic_loss + actor_loss
+
+        # gradients = tape.gradient( base_loss, self.trainable_variables )
+        # gradients, _ = tf.clip_by_global_norm( gradients, 0.5 )
+        # self.optimizer_b.apply_gradients( zip( gradients, self.trainable_variables ) )
         
-        self.fc1 = nalu( f1, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc2 = nalu( f2, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc3 = nalu( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
+        gradients_b = b_tape.gradient( base_loss,   b_vars )
+        gradients_c = c_tape.gradient( critic_loss, c_vars )
+        gradients_a = a_tape.gradient( actor_loss,  a_vars )
 
-        self.dp1 = tf.keras.layers.Dropout( .25 )
-        self.dp2 = tf.keras.layers.Dropout( .25 )
+        gradients_b, _ = tf.clip_by_global_norm( gradients_b, 0.5 )
+        gradients_c, _ = tf.clip_by_global_norm( gradients_c, 0.5 )
+        gradients_a, _ = tf.clip_by_global_norm( gradients_a, 0.5 )
 
-        self.gen = tf.random.get_global_generator()
+        self.optimizer_b.apply_gradients( zip( gradients_b, b_vars ) )
+        self.optimizer_c.apply_gradients( zip( gradients_c, c_vars ) )
+        self.optimizer_a.apply_gradients( zip( gradients_a, a_vars ) )
 
-        aux1 = state_dim
-        aux2 = self.ag_in_size
-        dvs = [ 0 ]
-        w = np.zeros( [ state_dim, self.ag_in_size ] )
-        for i in range( state_dim ):
-            dv = aux2 / aux1
-            v = ceil( dv ) if dv - int( dv ) > .5 else int( dv )
-            w[ i, np.sum( dvs ) : np.sum( dvs ) + v ] = ( 1 / v )
-            dvs.append( v )
-            aux1 -= 1
-            aux2 -= v
+        self.train_actor_loss( actor_loss )
+        self.train_critic_loss( critic_loss )
 
-        self.w = tf.cast( tf.convert_to_tensor( w ), tf.float32 )
-
-        self.log_dir = 'logs/agnnaluqrnet_{}'.format(name)
-
-        if train:
-
-            self.optimizer = Adam( tf.Variable( 2e-4 ) )
-            
-            if self.log:
-                run_number = 0
-                while os.path.exists(self.log_dir + str(run_number)):
-                    run_number += 1
-                self.log_dir = self.log_dir + str(run_number)
-                self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
-        
-        self.train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
-        self.train_l2_loss = tf.keras.metrics.Mean('train_l2_loss', dtype=tf.float32)
-        self.reward = tf.keras.metrics.Mean('reward', dtype=tf.float32)
-        self.actions = [ tf.keras.metrics.Mean('act_{}'.format(x), dtype=tf.float32) for x in range(action_dim) ]
-      
-    def __call__(self, states):
-        
-        """Build a network that maps state -> action values."""
-                
-        w_specs = tf.tile( tf.convert_to_tensor( [ states.shape[-1] / self.ag_in_size ] )[tf.newaxis, :], [ states.shape[0], 1 ] )
-        x = states @ self.w
-        x = tf.stop_gradient( tf.concat( [ x, w_specs ], axis = -1 ) )
-        
-        x = self.fc1( x )
-        if self.log: x = self.dp1( x )
-        x = self.fc2( x )
-        if self.log: x = self.dp2( x )
-        
-        return tf.reshape( self.fc3( x ), [ -1, self.action_dim, self.atoms ] )
-
-    def quantile_huber_loss(self, target, pred, actions):
-        
-        pred = tf.reduce_sum( pred * tf.expand_dims( actions, -1 ), axis = 1 )
-        pred_tile = tf.tile( tf.expand_dims( pred, axis = 2 ), [ 1, 1, self.atoms ] )
-        
-        target_tile = tf.cast( tf.tile( tf.expand_dims( target, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
-        
-        # huber_loss = tf.math.square( pred_tile - target_tile )
-        huber_loss = tf.compat.v1.losses.huber_loss( target_tile, pred_tile, reduction = tf.keras.losses.Reduction.NONE )
-        
-        tau = tf.cast( tf.reshape( np.array( self.tau ), [ 1, self.atoms ] ), tf.float32 )
-        inv_tau = tf.cast( 1.0 - tau, tf.float32 )
-        tau = tf.cast( tf.tile( tf.expand_dims( tau, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
-        inv_tau = tf.cast( tf.tile( tf.expand_dims( inv_tau, axis = 1 ), [ 1, self.atoms, 1 ] ), tf.float32 )
-        
-        error_loss = tf.math.subtract( target_tile, pred_tile )
-        loss = tf.where( tf.less( error_loss, 0.0 ), inv_tau * huber_loss, tau * huber_loss )
-        loss = tf.reduce_sum( tf.reduce_mean( loss, axis = 2 ), axis = 1 )
-        
-        return loss
-
-    def train(self, states, target, actions, we, step, bs):
-
-        with tf.GradientTape() as tape:
-            theta = self( states )
-            huber_loss = self.quantile_huber_loss( target, theta, actions ) * we
-            loss = tf.reduce_mean( huber_loss )            
-            l2_loss = ( 
-                  tf.nn.l2_loss( self.fc1.weights[3] )
-                + tf.nn.l2_loss( self.fc1.weights[5] )
-                + tf.nn.l2_loss( self.fc2.weights[3] )
-                + tf.nn.l2_loss( self.fc2.weights[5] )
-                + tf.nn.l2_loss( self.fc3.weights[3] )
-                + tf.nn.l2_loss( self.fc3.weights[5] ) 
-            )
-            t_loss = loss + ( 2e-6 * l2_loss )
-            
-        gradients = tape.gradient( t_loss, self.trainable_variables )
-        self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
-
-        self.train_loss( loss )
-        self.train_l2_loss( l2_loss )
-
-        return huber_loss, tf.reduce_mean( theta, axis = -1 )
+        return tf.reduce_mean( critic, axis = -1 ), actor_loss, critic_loss, logits
 
 
 class RecurrentQRNetwork(tf.Module):
@@ -757,10 +1483,10 @@ class RecurrentNALUQRNetwork(tf.Module):
         self.action_dim = action_dim
         self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
                                 
-        self.fc1s = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc1h = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc2 = nalu( f2, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc3 = nalu( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1s = nalu_transform( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1h = nalu_transform( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc2 = nalu_transform( f2, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc3 = nalu_transform( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
 
         if typer == 's':
             self.fcr = SimpleRNNCell( r, activation = tf.nn.tanh, dropout = 0 if log else .25 )
@@ -899,21 +1625,29 @@ class TransformerNALUQRNetwork(tf.Module):
         self.action_dim = action_dim
         self.tau = [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * self.atoms ) for i in range( 1, self.atoms + 1 ) ]
                                 
-        self.fc1s = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc1h = nalu( f1, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc2 = nalu( f2, activation = tf.nn.elu, kernel_initializer = tf.keras.initializers.random_normal() )
-        self.fc3 = nalu( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1s = nalu_transform( f1, activation = tf.keras.activations.gelu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc1h = Dense( f1, activation = tf.keras.activations.gelu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc2 = nalu_transform( f2, activation = tf.keras.activations.gelu, kernel_initializer = tf.keras.initializers.random_normal() )
+        self.fc3 = Dense( action_dim * self.atoms, kernel_initializer = tf.keras.initializers.orthogonal() )
            
         self.rnn = transformer_layer( f1, 4, 1, max_len )
 
         self.dp1 = tf.keras.layers.Dropout( .25 )
         self.dp2 = tf.keras.layers.Dropout( .25 )
 
+        self.stepsct = 100
+        self.change = False
+        self.threshold = 0.7
+
         self.log_dir = 'logs/tnaluqrnet_{}'.format(name)
 
         if train:
             
-            self.optimizer = Adam( tf.Variable( 2e-4 ) )
+            # self.optimizer_initial = Adam( tf.Variable( 2e-4 ) )
+            # self.optimizer_end = SGD( tf.Variable( 2e-4 ) )
+
+            self.optimizer_initial = SGD( tf.Variable( 2e-4 ) )
+            self.optimizer_end = Adam( tf.Variable( 2e-4 ) )
             
             if reduce == 'sum':
                 self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss, axis = 1 ) )
@@ -948,25 +1682,35 @@ class TransformerNALUQRNetwork(tf.Module):
         
         """Build a network that maps state -> action values."""        
         
+        # State Understanding 
         bs, ss, _ = shape_list( states )
 
-        # compute input embeding
-        xs = self.fc1s( states )
+        states = tf.stack( [ states, states ], axis = 1 )
 
-        # compute temporal state
-        xt, h, msks = self.rnn( xs,  past )
+        ## compute input embeding
+        xs = self.fc1s( states )
+        xs1, xs2 = tf.unstack( xs, axis = 1 )
+
+        ## compute temporal state
+        xt, hr, msks = self.rnn( xs2,  past )
         xh = self.fc1h( xt )
         
-        # residual sum ( current state + temporal state )
-        x = xh + xs
-        if self.log: x = self.dp1( x )
+        ## current state and temporal state
+        xr = tf.stack( [ xs1, xh ], axis = 1 )
+        if self.log: xr = self.dp1( xr )
         
-        x = self.fc2( x )
-        if self.log: x = self.dp2( x )        
-        
-        pred = self.fc3( x )
+        # Feature Creator
+        x2 = self.fc2( xr )
+        if self.log: x2 = self.dp2( x2 )
 
-        return tf.reshape( pred, [ bs, ss, self.action_dim, self.atoms ] ), h, msks
+        # Actor        
+        h1, h2 = tf.unstack( x2, axis = 1 )
+        h = tf.concat( [ h1, h2 ], axis = -1 )
+        
+        # pred = tf.nn.tanh( tf.reshape( self.fc3( h ), [ bs, ss, self.action_dim, self.atoms ] ) )
+        pred = tf.reshape( self.fc3( h ), [ bs, ss, self.action_dim, self.atoms ] )
+
+        return pred, hr, msks, ( xs1, xs2, xt, xh, h1, h2 )
     
     def quantile_huber_loss(self, target, pred, actions):
         
@@ -989,24 +1733,44 @@ class TransformerNALUQRNetwork(tf.Module):
         
         return loss
 
-    def train(self, states, target, actions, rewards, dones):
+    def train(self, states, target, actions, rewards, dones, step):
 
         with tf.GradientTape() as tape:
 
-            theta, _, msks = self( states )
+            theta, _, msks, _ = self( states )
             
             huber_loss = self.quantile_huber_loss( target, theta, actions ) * tf.cast( rewards != 0, tf.float32 )
             loss = self.reduce( huber_loss )
 
-            t_loss = loss
-            
+            l2_loss =\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.fc1s.weights    ] ) +\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.fc1h.weights    ] ) +\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.fc2.weights     ] ) +\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.rnn.weights[1:] ] ) +\
+               tf.reduce_sum( [ tf.nn.l2_loss( w ) for w in self.fc3.weights     ] )
+
+            t_loss = loss + ( 9e-5 * l2_loss )
+        
         gradients = tape.gradient( t_loss, self.trainable_variables )
-        self.optimizer.apply_gradients( zip( gradients, self.trainable_variables ) )
 
         self.train_loss( loss )
-        self.train_l2_loss( 0 )
+        self.train_l2_loss( 9e-5 * l2_loss )
 
-        return huber_loss, tf.reduce_mean( theta, axis = -1 ), msks
+        self.optimizer_end.apply_gradients( zip( gradients, self.trainable_variables ) )
+
+        # if self.train_loss.result().numpy() <= self.threshold and not self.change:
+        #     self.change = True
+        #     self.stepsct = 100
+        #     self.threshold = 0.7 * self.threshold
+
+        # if ( self.stepsct > 0 and self.change ) or self.train_loss.result().numpy() <= self.threshold:
+        #     self.optimizer_end.apply_gradients( zip( gradients, self.trainable_variables ) )
+        #     self.stepsct -= 1
+        # else:
+        #     self.change = False
+        #     self.optimizer_initial.apply_gradients( zip( gradients, self.trainable_variables ) )
+
+        return huber_loss, tf.reduce_mean( theta, axis = -1 ), loss, msks, self.change
 
 
 class C51Network(tf.Module):
