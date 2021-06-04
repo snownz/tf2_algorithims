@@ -25,6 +25,9 @@ def save_checkpoint(model, base_dir, step):
 
 def restore_checkpoint(model, base_dir):
 
+    print("\n\n=========================================================================================\n")
+    print("Loading from: {}".format(base_dir))
+    print("\n=========================================================================================\n\n")
     checkpoint = tf.train.Checkpoint( model = model )
     manager = tf.train.CheckpointManager( checkpoint, directory = base_dir, max_to_keep = 5 )
     status = checkpoint.restore( manager.latest_checkpoint )

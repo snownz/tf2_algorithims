@@ -298,6 +298,7 @@ class Environment(Process):
 
             state, reward, done, info = self.env.step(action)
             state = np.reshape(state, [1, self.state_size])
+            # reward *= 100
 
             if done:
                 state = self.env.reset()
