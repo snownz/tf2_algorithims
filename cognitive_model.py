@@ -5,41 +5,162 @@ from tensorflow.keras.initializers import he_normal, orthogonal, random_normal, 
 import numpy as np
 from tensorflow.keras.mixed_precision import LossScaleOptimizer
 from functools import partial
-from ann_utils import nalu_transform, tdnc_v2, dense, transformer_layer, nalu_transform_w, dense_w, norm
+from ann_utils import nalu_transform, tdnc_v2, dense, transformer_layer, nalu_transform_w, dense_w, norm, convnalu2d, vector_quantizer, flatten
 from math import ceil
 
 class StateUnderstanding(Layer):
 
-    def __init__(self, state_dim, f1, f2, train=False):
+    def __init__(self):
 
         super(StateUnderstanding, self).__init__()
 
-        self.to_train = train
-              
-        self.fc1 = nalu_transform( f1, activation = elu, kernel_initializer = truncated_normal(), name = 'su1' )
-        self.fc2 = nalu_transform( f2, activation = elu, kernel_initializer = truncated_normal(), name = 'su2' )
+        # base
+        self.kl_divider = 32768*2
+        self.beta = 0.7
+        self.C = 0
+        self.gamma = 100
+        self.embedding_dim = 32
+        self.num_embeddings = 32
+        self.commitment_cost = 0.25
+        
+        ## encoder
+        self.e_c1 = convnalu2d( 'enc_c1', 32,  4, 2, padding = "same" )
+        self.e_c2 = convnalu2d( 'enc_c2', 64,  4, 2, padding = "same" )
+        self.e_c3 = convnalu2d( 'enc_c3', 128, 4, 1, padding = "same" )
 
-        self.dp1 = tf.keras.layers.Dropout( .25 )
-        self.dp2 = tf.keras.layers.Dropout( .25 )
+        self.e_pre_vae = convnalu2d( 'enc_c5', self.num_embeddings, 1, 1, padding = "same" )
+        self.e_vq = vector_quantizer( self.embedding_dim, self.num_embeddings, self.commitment_cost, 'enc_vq' )
 
-    def feature_extract(self, x, eval=True):
+        self.e1_norm = BatchNormalization(name='enc_1')
+        self.e2_norm = BatchNormalization(name='enc_2')
+        self.e3_norm = BatchNormalization(name='enc_3')
+        self.e4_norm = BatchNormalization(name='enc_4')
         
-        x = x
+        ## decoder
+        self.d_c1 = Conv2DTranspose( 128, 5, 2, name = 'dec_c1', activation = relu, padding = 'same' )
+        self.d_c2 = Conv2DTranspose( 64,  5, 2, name = 'dec_c2', activation = relu, padding = 'same' )
+        self.d_c3 = Conv2DTranspose( 32,  6, 1, name = 'dec_c3', activation = relu, padding = 'same' )
+
+        self.d1_norm = BatchNormalization(name='dec_1')
+        self.d2_norm = BatchNormalization(name='dec_2')
+        self.d3_norm = BatchNormalization(name='dec_3')
+
+        self.out = Conv2DTranspose( 3, 6, 1, name = 'dec_out', activation = sigmoid, padding = 'same' )
+
+        self.colors = tf.Variable( np.random.randint( 0, 255, [ self.num_embeddings, 3 ] ), trainable = False )
+
+    def encode(self, state, eval=True):
+
+        x0 = state
+
+        x1 = self.e_c1( x0 )
+        x1 = self.e1_norm( x1, training = not eval )
+
+        x2 = self.e_c2( x1 )
+        x2 = self.e2_norm( x2, training = not eval)
+
+        x3 = self.e_c3( x2 )
+        x3 = self.e3_norm( x3, training = not eval )
+
+        pre_vae = self.e_pre_vae( x3 )
+        vq = self.e_vq( pre_vae )
+
+        return vq
+
+    def decode(self, features, eval=True):
+
+        x0 = features
         
-        # Process non-linear tranformation and linear arithmetic
-        x1 = self.fc1( x )
-        x1 = self.dp1( x1 )
-        if not eval: x1 = self.dp1( x1 )
-        x2 = self.fc2( x1 )
-        x2 = self.dp2( x2 )
-        if not eval: x2 = self.dp2( x2 )
-        
-        return x2
+        x2 = self.d_c1( x0 )
+        x2 = self.d1_norm( x2, training = not eval )
+
+        x3 = self.d_c2( x2 )
+        x3 = self.d2_norm( x3, training = not eval )
+
+        x4 = self.d_c3( x3 )
+        x4 = self.d3_norm( x4, training = not eval )
+
+        dec = self.out( x4 )
+
+        return dec
+
+    def reconstruction_loss(self, y_true, y_pred):
+
+        y_true_flat = flatten( y_true )
+        y_pred_flat = flatten( y_pred )
+
+        return tf.reduce_mean( tf.abs( y_true_flat - y_pred_flat ), axis = -1 )
 
     def call(self, state, eval=True):
 
-        x = self.feature_extract( state, eval )
-        return x
+        vq = self.encode( state, eval )
+        dec = self.decode( vq['quantize'], eval )
+        vq['rec_loss'] = self.reconstruction_loss( state, dec )
+        
+        return vq, dec
+
+    @property
+    def variables(self):
+        return self.trainable_variables
+
+    @property
+    def index_shape(self):
+        return [ 32, 32 , self.num_embeddings ]
+
+class GlobalMemory(Layer):
+
+    def __init__(self, action_dim, h_size, m, n, encoder_size, n_read=4, lr=1, decay=1e10):
+        
+        super(GlobalMemory, self).__init__()
+        
+        self.action_dim = action_dim
+        self.encoder_size = encoder_size
+        
+        self.memory = tdnc_v2( h_size, ( m, n ),  n_read,  lr, decay )
+
+        self.aw = tf.Variable( tf.random.normal( [ action_dim, encoder_size ] ), trainable = True, name = 'aw_memory' )
+        self.dw = tf.Variable( tf.random.normal( [ 2, encoder_size ] ), trainable = True, name = 'dw_memory' )
+
+    def reset(self, bs):
+        return self.memory.reset( bs )
+
+    def get_ac_emb(self, ac):
+        return tf.gather( self.aw, tf.cast( ac, tf.int32 ) )
+        
+    def call(self, state, pstate, ac, rw, dn, step, params):
+        
+        # action encoder
+        ae = tf.gather( self.aw, tf.cast( ac, tf.int32 ) )
+
+        # reward encoder
+        re = tf.random.normal( shape = [ tf.shape( rw )[0], tf.shape( rw )[1], self.encoder_size ], mean = rw[:,:,tf.newaxis], stddev = 0.001 )
+
+        # done encoder
+        de = tf.gather( self.dw, tf.cast( dn, tf.int32 ) )
+
+        # env reactions
+        ard = ae + re + de
+
+        # read and write features
+        f_read = tf.concat( [ state, tf.zeros_like( ard ) ], axis = -1 )
+        f_write = tf.concat( [ pstate, ard ], axis = -1 )
+
+        ## model memory
+        y, p_state = self.memory( f_read, f_write, params, step )
+        
+        return y, p_state[:-1], ae
+
+    @property
+    def variables(self):
+        return self.trainable_variables
+
+
+
+
+
+
+
+
 
 
 class StateUnderstanding_v2(Layer):
@@ -393,59 +514,6 @@ class StateUnderstandingMultiEnv_v3(Layer):
         hprev, presentprev, _, _ = self.feature_extract( pstate, env, past, eval )
         
         return h, hprev, present, presentprev, mask, vls
-
-
-class GlobalMemory(Layer):
-
-    def __init__(self, action_dim, h_size, m, n, encoder_size, max_size, 
-                 num_blocks=2, n_read=4, n_att_heads=4, lr=1, decay=1e10, train=False):
-        
-        super(GlobalMemory, self).__init__()
-        
-        self.to_train = train
-        self.action_dim = action_dim
-        self.encoder_size = encoder_size
-        
-        self.memory = tdnc_v2( h_size, max_size, ( m, n ), num_blocks, n_read, n_att_heads, lr, decay )
-        self.t = dense( h_size, activation = gelu, initializer = he_normal() )
-
-        self.dp1 = tf.keras.layers.Dropout( .25 )
-
-        self.aw = tf.Variable( tf.random.normal( [ action_dim, encoder_size ] ) )
-        self.dw = tf.Variable( tf.random.normal( [ 2, encoder_size ] ) )
-
-    def reset(self, bs):
-        return self.memory.reset( bs )
-
-    def call(self, state, pstate, ac, rw, dn, x_w, step, params, past=None, eval=True):
-        
-        # action encoder
-        ae = tf.gather( self.aw, tf.cast( ac, tf.int32 ) )
-
-        # reward encoder
-        re = tf.random.normal( shape = [ tf.shape( rw )[0], tf.shape( rw )[1], self.encoder_size ], mean = rw[:,:,tf.newaxis], stddev = 0.001 )
-
-        # done encoder
-        de = tf.gather( self.dw, tf.cast( dn, tf.int32 ) )
-
-        # env reactions
-        ard = ae + re + de
-
-        # read and write features
-        a_state, t_state = tf.unstack( state, axis = 1 )
-        a_pstate, t_pstate = tf.unstack( pstate, axis = 1 )
-
-        hread = t_state + self.t( a_state )
-        hwrite = t_pstate + self.t( a_pstate )
-
-        f_read = tf.concat( [ hread, tf.zeros_like( ard ) ], axis = -1 )
-        f_write = tf.concat( [ hwrite, ard ], axis = -1 )
-
-        ## model memory
-        y, p_state, mask = self.memory( f_read, f_write, x_w, past, params, step )
-        
-        if not eval: return self.dp1( y ), p_state[:-1], mask 
-        else: return y, p_state[:-1], mask
 
 
 class FeatureCreator(Layer):

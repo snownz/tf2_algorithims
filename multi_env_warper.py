@@ -5,6 +5,7 @@ import pickle
 import cloudpickle
 import numpy as np
 import gym
+from gym import spaces
 import cv2 as cv
 from collections import namedtuple
 from threading import Thread, Lock
@@ -274,10 +275,12 @@ class CloudpickleWrapper(object):
 
 class Environment(Process):
 
-    def __init__(self, env_idx, child_conn, env_name, state_size, action_size, visualize=False):
+    def __init__(self, env_idx, child_conn, env_name, state_size, action_size, visualize=False, warper=None):
         
         super(Environment, self).__init__()
         self.env = gym.make(env_name)
+        if not warper is None:
+            self.env = warper( self.env )
         self.is_render = visualize
         self.env_idx = env_idx
         self.child_conn = child_conn
@@ -305,3 +308,91 @@ class Environment(Process):
                 state = np.reshape(state, [1, self.state_size])
 
             self.child_conn.send([state, reward, done, info])
+
+
+class VisionEnvironment(Process):
+
+    def __init__(self, env_idx, child_conn, env_name, action_size, visualize=False):
+        
+        super(VisionEnvironment, self).__init__()
+        self.env = ImageEnv( gym.make(env_name) )
+        self.is_render = visualize
+        self.env_idx = env_idx
+        self.child_conn = child_conn
+        self.state_size = list( self.env.observation_space.shape )
+        self.action_size = action_size
+
+    def run(self):
+
+        super(VisionEnvironment, self).run()
+        si, sv = self.env.reset()
+        si = np.reshape(si, [1] + list( self.state_size ) )
+        self.child_conn.send((si, sv))
+        
+        while True:
+            action = self.child_conn.recv()
+            state, reward, done, info = self.env.step(action)
+
+            si = np.reshape(state[0], [1] + list( self.state_size ) )
+            sv = state[1]
+            # reward *= 100
+
+            if done:
+                si, sv = self.env.reset()
+                si = np.reshape(si, [1] + list( self.state_size ) )
+
+            self.child_conn.send([(si, sv), reward, done, info])
+
+
+class ImageEnv(gym.Wrapper):
+    
+    def __init__(self, env):
+
+        gym.Wrapper.__init__(self, env)
+        self.observation_space = spaces.Box( low=0, high=255, shape = ( 128 , 128, 3 ), dtype = env.observation_space.dtype )
+        env.viewer = None
+
+    def reset(self):
+        ob_v = self.env.reset()
+        ob = self.env.render( mode = "rgb_array" )
+        ob = ( cv.resize( ob, ( 128, 128 ) ) / 256.0 ).astype( np.float32 )
+        return ( ob, ob_v )
+
+    def step(self, action):
+        ob_v, reward, done, info = self.env.step(action)
+        ob1 = self.env.render( mode = "rgb_array" )
+        ob2 = ( cv.resize( ob1, ( 128, 128 ) ) / 256.0 ).astype( np.float32 )
+        return ( ob2, ob_v ), reward, done, info
+
+
+class miniGridEnv(gym.Wrapper):
+    
+    def __init__(self, env):
+
+        gym.Wrapper.__init__(self, env)
+        env.viewer = None
+        self.observation_space = spaces.Box( low=0, high=255, shape = [ 147 ] )
+
+    def reset(self):
+        ob = self.env.reset()
+        return ob['image'].astype(np.float32).flatten()
+
+    def step(self, action):
+        ob, reward, done, info = self.env.step(action)
+        return ob['image'].astype(np.float32).flatten(), reward, done, info
+
+
+class floatEnv(gym.Wrapper):
+    
+    def __init__(self, env):
+
+        gym.Wrapper.__init__(self, env)
+        env.viewer = None
+
+    def reset(self):
+        ob = self.env.reset()
+        return ob.astype(np.float32)
+
+    def step(self, action):
+        ob, reward, done, info = self.env.step(action)
+        return ob.astype(np.float32), reward, done, info

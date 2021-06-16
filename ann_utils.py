@@ -1,9 +1,10 @@
 import tensorflow as tf
-from tensorflow.keras.layers import Layer, LayerNormalization, Dense, RNN, Conv1D
+from tensorflow.keras.layers import Layer, LayerNormalization, Dense, RNN, Conv1D, SimpleRNNCell, GRUCell, GlobalAveragePooling2D
 from tensorflow.keras.activations import gelu, sigmoid, tanh
 import numpy as np
 from tensorflow.keras.mixed_precision import LossScaleOptimizer
 from functools import partial
+from tensorflow.keras.initializers import GlorotUniform
 
 def shape_list(x):
     static = x.shape.as_list()
@@ -138,19 +139,54 @@ class dense(Layer):
         return self.activation( x )
 
 
+class simple_rnn(SimpleRNNCell):
+
+    def __init__(self, num_outputs, name, activation = lambda x: x, kernel_initializer=tf.keras.initializers.truncated_normal(), bias=True, norm_h=True):
+        super(simple_rnn, self).__init__( num_outputs, activation, bias, kernel_initializer, name = name )
+        self.norm_h = norm_h
+        self.norm = norm( name )
+
+    def build(self, input_shape):
+        super().build( input_shape )
+        if self.norm_h:
+            self.norm.build( tf.TensorShape( [ self.state_size ] ) )
+   
+    def call(self, inputs, states):
+        x, h = super().call( inputs, states )        
+        if self.norm_h: return x, self.norm( h[0] )
+        else: return x, h
+
+
+class gru(GRUCell):
+
+    def __init__(self, num_outputs, name, activation = lambda x: x, kernel_initializer=tf.keras.initializers.truncated_normal(), bias=True, norm_h=True):
+        super(gru, self).__init__( num_outputs, activation = activation, use_bias = bias, kernel_initializer = kernel_initializer, name = name )
+        self.norm_h = norm_h
+        self.norm = norm( name )
+
+    def build(self, input_shape):
+        super().build( input_shape )
+        if self.norm_h:
+            self.norm.build( tf.TensorShape( [ self.state_size ] ) )
+   
+    def call(self, inputs, states):
+        x, h = super().call( inputs, states )        
+        if self.norm_h: return x, self.norm( h[0] )
+        else: return x, h
+
+
 class norm(Layer):
 
-    def __init__(self, axis=-1, epsilon=1e-5):
+    def __init__(self, name, axis=-1, epsilon=1e-5):
         
-        super(norm, self).__init__()
+        super(norm, self).__init__(name=name)
         self.axis = axis
         self.epsilon = epsilon
-        
 
     def build(self, input_shape):
 
-        self.g = self.add_weight( 'g', shape = [ int( input_shape[-1] ) ], initializer = tf.constant_initializer( 1 ), trainable = True )
-        self.b = self.add_weight( 'b', shape = [ int( input_shape[-1] ) ], initializer = tf.constant_initializer( 0 ), trainable = True )
+        self.g = self.add_weight( name = 'nomr_g', shape = [ int( input_shape[-1] ) ], initializer = tf.constant_initializer( 1 ), trainable = True )
+        self.b = self.add_weight( name = 'nomr_b', shape = [ int( input_shape[-1] ) ], initializer = tf.constant_initializer( 0 ), trainable = True )
         
     def call(self, input):
 
@@ -192,14 +228,11 @@ class dense_w(Layer):
 
 class nalu(Layer):
 
-    def __init__(self, num_outputs, kernel_initializer, activation=lambda x:x, initializer=tf.keras.initializers.truncated_normal(), bias=True):
+    def __init__(self, num_outputs, name, initializer=tf.keras.initializers.truncated_normal()):
         
-        super(nalu, self).__init__()
+        super(nalu, self).__init__(name=name)
         self.num_outputs = num_outputs
-        self.use_bias = bias
         self.initializer = initializer
-        self.kernel_initializer = kernel_initializer
-        self.activation = activation
            
     def build(self, input_shape):
 
@@ -241,7 +274,7 @@ class nalu_transform(Layer):
         self.kernel_1 = self.add_weight( 'kernel_1', shape = [ int( input_shape[-1] ), self.num_outputs], initializer = self.kernel_initializer )
         self.kernel_3 = self.add_weight( 'kernel_3', shape = [ self.num_outputs * 3, self.num_outputs], initializer = self.kernel_initializer )
         self.embeding_k = self.add_weight( 'embeding_k', shape = [ 1, input_shape[ -1 ], 1 ], initializer = self.initializer )
-        self.norm = norm()
+        self.norm = norm('norm')
                 
         if self.use_bias:
             self.bias_1 = self.add_weight( 'bias_1', shape = [ self.num_outputs ], initializer = tf.keras.initializers.Zeros() )
@@ -403,28 +436,100 @@ class nalu_gru_cell(Layer):
 
 class conv2d(Layer):
 
-    def __init__(self, kernel_size, channels, stride, padding="SAME", initializer=tf.keras.initializers.Orthogonal(), bias=True):
-        super(conv2d, self).__init__()
-        self.kn = kernel_size
-        self.ch = channels
-        self.s = stride
-        self.p = padding
+    def __init__(self, name,  filters, kernel, stide, padding = 'same', activation = lambda x: x, initializer=tf.keras.initializers.he_normal(), bias=True):
+        super(conv2d, self).__init__(name=name)
+        self.f = filters
+        self.k = kernel
+        self.s = stide
+        self.p = padding.upper()
         self.use_bias = bias
+        self.activation = activation
         self.initializer = initializer
-        
+    
     def build(self, input_shape):
-        # kernel shape
-        k = [ self.kn, self.kn, input_shape[-1], self.ch ] if type( self.kn ) is int else [ self.kn[0], self.kn[1], input_shape[-1], self.ch ]
-        self.kernel = self.add_weight( "kernel_2d", shape = k, initializer = self.initializer )
+
+        k = [ self.k, self.k, input_shape[-1], self.f ] if type( self.k ) is int else [ self.k[0], self.k[1], input_shape[-1], self.f ]
         self.strides = ( 1, self.s, self.s, 1 ) if type( self.s ) is int else ( 1, self.s[0], self.s[1], 1 )
+        
+        self.kernel = self.add_weight( 'kernel', shape = k, initializer = self.initializer, trainable = True )
         if self.use_bias:
-            self.bias = self.add_weight( 'bias', shape = [ self.ch ], initializer = tf.keras.initializers.Zeros() )
+            self.bias = self.add_weight( 'bias', shape = [ self.f ], initializer = tf.keras.initializers.Zeros(), trainable = True )
 
     def call(self, input):
-        x = tf.nn.conv2d( input, self.kernel, self.strides, padding = self.p )
+
+        c = tf.nn.conv2d( input, self.kernel, self.strides, padding = self.p )
+        c = tf.nn.bias_add( c, self.bias, name = "_bias" )
+
         if self.use_bias:
-            x = tf.nn.bias_add( x, self.bias, name = "_bias_add" )
-        return x
+            c += self.bias
+
+        return self.activation( c )
+
+
+class convnalu2d(Layer):
+
+    def __init__(self, name,  filters, kernel, stide, padding = 'same', initializer=tf.keras.initializers.he_normal()):
+        super(convnalu2d, self).__init__(name=name)
+        self.f = filters
+        self.k = kernel
+        self.s = stide
+        self.p = padding.upper()
+        self.initializer = initializer
+        self.pooling = GlobalAveragePooling2D()
+    
+    def build(self, input_shape):
+
+        k = [ self.k, self.k, input_shape[-1], self.f ] if type( self.k ) is int else [ self.k[0], self.k[1], input_shape[-1], self.f ]
+        self.strides = ( 1, self.s, self.s, 1 ) if type( self.s ) is int else ( 1, self.s[0], self.s[1], 1 )
+                
+        self.gt = self.add_weight( "w_gt", [ input_shape[ -1 ], self.f ], initializer = self.initializer, trainable = True  )
+        self.wt = self.add_weight( "w_wt", k, initializer = self.initializer, trainable = True  )
+        self.mt = self.add_weight( "w_mt", k, initializer = self.initializer, trainable = True )
+
+    def call(self, input):
+        
+        avg_poll = tf.reshape( self.pooling( input ), [-1, 1, 1, input.shape[-1] ] )
+        w = tf.multiply( tf.tanh( self.wt ), tf.sigmoid( self.mt ) )
+        g = tf.sigmoid( tf.matmul( avg_poll, self.gt ) )
+        a = tf.nn.conv2d( input, w, self.strides, padding = self.p )        
+        m = tf.sinh( tf.nn.conv2d( tf.asinh( input ), w, self.strides, padding = self.p ) )
+        arithimetic_x = ( g * a ) + ( ( 1 - g ) * m )
+
+        return arithimetic_x
+
+
+class conv2dt(Layer):
+
+    def __init__(self, name, filters, kernel, stide, activation=lambda x:x, padding = 'same', initializer=tf.keras.initializers.he_normal(), bias=True):
+        super(conv2dt, self).__init__(name=name)
+        self.f = filters
+        self.k = kernel
+        self.s = stide
+        self.p = padding.upper()
+        self.use_bias = bias
+        self.activation = activation
+        self.initializer = initializer
+    
+    def build(self, input_shape):
+
+        k = [ self.k, self.k, self.f, input_shape[-1] ] if type( self.k ) is int else [ self.k[0], self.k[1], self.f, input_shape[-1] ]
+        self.strides = ( 1, self.s, self.s, 1 ) if type( self.s ) is int else ( 1, self.s[0], self.s[1], 1 )
+        self.out_shape = [ input_shape[1] * self.s, input_shape[2] * self.s, self.f ] if type( self.s ) is int \
+                    else [ input_shape[1] * self.s[0], input_shape[2] * self.s[1], self.f ]
+        
+        self.kernel = self.add_weight( 'kernel', shape = k, initializer = self.initializer, trainable = True )
+        if self.use_bias:
+            self.bias = self.add_weight( 'bias', shape = [ self.f ], initializer = tf.keras.initializers.Zeros(), trainable = True )
+
+    def call(self, input):
+        
+        bs, *_ = shape_list( input )
+        c = c = tf.nn.conv2d_transpose( input, self.kernel, [ bs ] + self.out_shape, self.strides, padding = self.p )
+        c = tf.nn.bias_add( c, self.bias, name = "_bias" )
+
+        if self.use_bias:
+            c += self.bias
+        return self.activation( c )
 
 
 class conv1d(Layer):
@@ -483,8 +588,8 @@ class transformer_block(Layer):
         self.ln2 = conv1d( num_outputs, 'ln2', initializer = initializer )
         self.merge = conv1d( num_outputs, 'merge', initializer = initializer )
 
-        self.norm1 = norm()
-        self.norm2 = norm()
+        self.norm1 = norm('n1')
+        self.norm2 = norm('n2')
         
         self.n_heads = n_heads
 
@@ -634,6 +739,68 @@ class transformer_nac_layer(Layer):
         msks = tf.stack( msks, axis = 0 )
 
         return tf.stack( ( h1, h2 ), axis = 1 ), presents, msks
+
+
+class vector_quantizer(Layer):
+
+    """Neural Discrete Representation Learning (https://arxiv.org/abs/1711.00937)"""
+    
+    def __init__(self, embedding_dim, num_embeddings, commitment_cost, name):
+        
+        super(vector_quantizer, self).__init__( name = name )
+        
+        # embedding_dim: D, num_embeddings: K
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.commitment_cost = commitment_cost
+        
+    def build(self, input_shape):
+        # (D, K)
+        self.w = self.add_weight( 'embedding', shape = [ self.embedding_dim, self.num_embeddings ], initializer = GlorotUniform(), trainable = True )
+        
+    def call(self, inputs):
+
+        # (BxHxW, D)
+        flat_inputs = tf.reshape( inputs, [ -1, self.embedding_dim ] )
+        
+        # (BxHxW, K) = (BxHxW, 1)                                              - (BxHxW, D) x (D, K)                  + (1, K)
+        distances    = ( tf.reduce_sum( flat_inputs**2, 1, keepdims = True ) ) - 2 * tf.matmul( flat_inputs, self.w ) + tf.reduce_sum( self.w**2, 0, keepdims = True )
+        
+        encoding_indices = tf.argmax( -distances, 1 ) # (BxHxW)
+        encodings = tf.one_hot( encoding_indices, self.num_embeddings ) # (BxHxW, K)
+        encoding_indices = tf.reshape( encoding_indices, tf.shape( inputs )[:-1] ) # (B, H, W)
+        quantized = self.quantize( encoding_indices ) # NOTICE (B, H, W, D)
+        
+        e_latent_loss = tf.reduce_mean( ( tf.stop_gradient( quantized ) - inputs ) ** 2 )
+        q_latent_loss = tf.reduce_mean( ( quantized - tf.stop_gradient( inputs ) ) ** 2 )
+        loss = q_latent_loss + self.commitment_cost * e_latent_loss
+        
+        # skip gradient to compute derivates for prior layers
+        quantized_skip = inputs + tf.stop_gradient( quantized - inputs )
+        
+        avg_probs = tf.reduce_mean( encodings, 0 )
+        # It indicates how many codes are 'active' on average.
+        perplexity = tf.exp( - tf.reduce_sum( avg_probs * tf.math.log( avg_probs + 1e-10 ) ) )
+        
+        return {
+            'quantize': quantized_skip,
+            'loss': loss,
+            'perplexity': perplexity,
+            'encodings': encodings,
+            'encoding_indices': encoding_indices
+        }
+
+    def get_vq(self, encoding_indices):
+        quantized = self.quantize( encoding_indices )
+        return quantized
+
+    @property
+    def embeddings(self):
+        return self.w
+
+    def quantize(self, encoding_indices): # (B, H, W)
+        w = tf.transpose( self.embeddings.read_value(), [1,0] ) # (K, D)
+        return tf.nn.embedding_lookup( w, encoding_indices )  # (B, H, W, D)
 
 
 """
@@ -1522,28 +1689,16 @@ class dnc(Layer):
 
 class dnc_v2(Layer):
 
-    def __init__(self, output_dim, memory_shape=(100, 20), n_read=3, external_controller=False, leaning_rate=0, memory_decay_steps=0):
+    def __init__(self, output_dim, memory_shape=(100, 20), n_read=3, leaning_rate=0, memory_decay_steps=0):
 
         super(dnc_v2, self).__init__()
-
-        self.external_controller = external_controller
 
         # define output data size
         self.output_dim = output_dim  # Y
         
         # define size of memory matrix
         self.N, self.W = memory_shape  # N, W
-
-        self.state_size = [ 
-            tf.TensorShape( [ self.N, self.W ] ),
-            tf.TensorShape( [ self.N, 1 ] ),
-            tf.TensorShape( [ self.N, self.N ] ),
-            tf.TensorShape( [ self.N, 1 ] ),
-            tf.TensorShape( [ self.N, n_read ] ),
-            tf.TensorShape( [ self.N, 1 ] ),
-            tf.TensorShape( [ 1 ] ),
-         ]
-
+        
         self.alpha = lambda x: leaning_rate * ( 1. / ( ( x / memory_decay_steps ) + 1 ) )
         
         # define number of read heads
@@ -1557,22 +1712,26 @@ class dnc_v2(Layer):
         # neural net output = output of controller + interface vector with memory
         self.controller_dim = self.output_dim + self.interface_dim  # Y+I
 
+        # controller variables
+        # initialize controller hidden state
+        # self.fc1 = dense( self.controller_dim, 'fc1_dnc', kernel_initializer = tf.keras.initializers.RandomNormal() )
+        # self.fc2 = dense( self.controller_dim, 'fc2_dnc', kernel_initializer = tf.keras.initializers.RandomNormal() )
+        self.fc1 = GRUCell( self.controller_dim, name = 'fc1_dnc', activation = gelu )
         
+        self.state_size = [ 
+            tf.TensorShape( [ self.N, self.W ] ),
+            tf.TensorShape( [ self.N, 1 ] ),
+            tf.TensorShape( [ self.N, self.N ] ),
+            tf.TensorShape( [ self.N, 1 ] ),
+            tf.TensorShape( [ self.N, n_read ] ),
+            tf.TensorShape( [ self.N, 1 ] ),
+            tf.TensorShape( [ 2, self.controller_dim ] ),
+         ]
 
-        if not external_controller:
-            # controller variables
-            # initialize controller hidden state
-            self.fc1 = dense( self.controller_dim, initializer = tf.keras.initializers.RandomNormal() )
-            self.fc2 = dense( self.controller_dim, initializer = tf.keras.initializers.RandomNormal() )
-        
+
     def build(self, input_shapes):
 
         # define and initialize weights for controller output and interface vectors
-        
-        if not self.external_controller:
-
-            self.W_output = self.add_weight( name = 'dnc_net_output_weights', shape = [ self.controller_dim, self.output_dim ], 
-                                            initializer = tf.keras.initializers.truncated_normal( stddev = 0.1 ) ) # [Y+I,Y]
         
         self.W_interface = self.add_weight( name = 'dnc_interface_weights', shape = [ self.controller_dim, self.interface_dim ], 
                                             initializer = tf.keras.initializers.truncated_normal( stddev = 0.1 ) ) # [Y+I,I]
@@ -1580,7 +1739,7 @@ class dnc_v2(Layer):
         self.W_read_out = self.add_weight( name = 'dnc_read_vector_weights', shape = [ self.R * self.W, self.output_dim ], 
                                            initializer = tf.keras.initializers.truncated_normal( stddev = 0.1 ) ) # [R*W,Y]
 
-        self.lr_controller = self.add_weight( 'learnig_rate', [ self.controller_dim, 8 ] , initializer = tf.keras.initializers.random_normal() )
+        # self.lr_controller = self.add_weight( 'dnc_learnig_rate', [ self.controller_dim, 8 ] , initializer = tf.keras.initializers.random_normal() )
         
     def reset(self, bs):
 
@@ -1600,7 +1759,7 @@ class dnc_v2(Layer):
         W_read = tf.fill( [ bs, self.N, self.R ], 1e-6 )  # [N,R]
         W_write = tf.fill( [ bs, self.N, 1 ], 1e-6 )  # [N,1]
 
-        return M, usage, L, W_precedence, W_read, W_write
+        return M, usage, L, W_precedence, W_read, W_write, tf.zeros( [ bs, 2, self.controller_dim ] )
     
     def content_lookup(self, key, strength, M):
         """
@@ -1666,10 +1825,9 @@ class dnc_v2(Layer):
         # return tf.reshape( W_alloc, [ bs, self.N, 1 ] )
         return W_alloc[:,:,tf.newaxis]
     
-    def controller(self, x):
-        x1 = tf.keras.activations.gelu( self.fc1( x ) )
-        x2 = self.fc2( x1 )
-        return x2
+    def controller(self, x, h):
+        x1, h1 = self.fc1( x, h )
+        return x1, h1
     
     def partition_interface(self, interface):
 
@@ -1813,7 +1971,7 @@ class dnc_v2(Layer):
 
         return n_L, n_W_precedence, n_W_read, read_v
 
-    def step(self, x_read, x_write, M, usage, L, W_precedence, W_read, W_write, lr):
+    def step(self, x_read, x_write, M, usage, L, W_precedence, W_read, W_write, h_controller, lr):
         
         bs = tf.shape(x_read)[0]
 
@@ -1821,13 +1979,11 @@ class dnc_v2(Layer):
         Update the controller, compute the output and interface vectors,
         write to and read from memory and compute the output.
         """
-        # update controller
-        if self.external_controller:
-            controller_read_out = x_read
-            controller_write_out = x_write
-        else:
-            controller_read_out = self.controller( x_read )
-            controller_write_out = self.controller( x_write )
+        hc1, hc2 = tf.split( h_controller, 2, axis = 1 )
+        controller_read_out, c1 = self.controller( x_read, hc1[:,0,...] )
+        controller_write_out, c2 = self.controller( x_write, hc2[:,0,...] )
+
+        hc = tf.stack( ( c1, c2 ), axis = 1 )
 
         # write to memory
         n_M, n_W_write, n_usage = self.step_write( controller_write_out, usage, W_read, W_write, M, lr )
@@ -1837,33 +1993,25 @@ class dnc_v2(Layer):
         
         # flatten read vectors and multiply them with W matrix before adding to controller output
         read_v_out = tf.matmul( tf.reshape( read_v, [ bs, self.R * self.W ] ), self.W_read_out )  # [1,RW]*[RW,Y] -> [1,Y]
-
-        if not self.external_controller:
-            
-            # compute output vectors
-            output_v = tf.matmul( controller_read_out, self.W_output )  # [1,Y+I] * [Y+I,Y] -> [1,Y]
-
-            # compute output
-            y = output_v + read_v_out
-            
-            return y, n_M, n_usage, n_L, n_W_precedence, n_W_read, n_W_write[:,:,tf.newaxis]
         
-        return read_v_out, n_M, n_usage, n_L, n_W_precedence, n_W_read, n_W_write[:,:,tf.newaxis]
+        return read_v_out, n_M, n_usage, n_L, n_W_precedence, n_W_read, n_W_write[:,:,tf.newaxis], hc
 
     def call(self, inputs, states):
 
         x_read, x_write = tf.unstack( inputs, axis = 1 )
 
-        M, usage, L, W_precedence, W_read, W_write, step = states
+        M, usage, L, W_precedence, W_read, W_write, h_controller = states
 
         # lr controler
-        # lr = ( sigmoid( tf.reduce_mean( tf.matmul( x_write, self.lr_controller ), axis = -1 ) ) * self.alpha( step )[:,0] )[:,tf.newaxis]
-        lr = tf.cast( self.alpha( step ), tf.float32 )
+        # lr = tf.cast( self.alpha( step ), tf.float32 )
+        lr = tf.constant( 1.0, tf.float32 )
 
         ( y_seq, n_M, n_usage, n_L, n_W_precedence, n_W_read, 
-          n_W_write ) = self.step( x_read, x_write, M, usage, L, W_precedence, W_read, W_write, lr )
+          n_W_write, h_controller ) = self.step( x_read, x_write, M, usage, L, W_precedence, W_read, W_write, h_controller, lr )
 
-        return y_seq, ( n_M, n_usage, n_L, n_W_precedence, n_W_read, n_W_write, step + 1 )
+        # h_controller = tf.concat( [ n_usage[:,:,0], n_W_write[:,:,0] ], axis = -1 )
+
+        return y_seq, ( n_M, n_usage, n_L, n_W_precedence, n_W_read, n_W_write, h_controller )
 
 
 class tdnc(Layer):
@@ -1907,50 +2055,37 @@ class tdnc(Layer):
 
 class tdnc_v2(Layer):
 
-    def __init__(self, output_dim, max_len_seq, memory_shape=(100, 20), num_blocks=1, n_read=3, n_att_heads=4, leaning_rate=1, memory_decay_steps=10000):
+    def __init__(self, output_dim, memory_shape=(100, 20), n_read=3, leaning_rate=1, memory_decay_steps=10000):
 
         super(tdnc_v2, self).__init__()
 
         self.output_dim = output_dim
 
-        self.transformer = transformer_layer( output_dim * n_att_heads, n_att_heads, num_blocks, max_len_seq, embeding_inputs = True )
-        self.memory = dnc_v2( output_dim, memory_shape, n_read, external_controller = True, leaning_rate = leaning_rate, memory_decay_steps = memory_decay_steps )
+        self.memory = dnc_v2( output_dim, memory_shape, n_read, leaning_rate = leaning_rate, memory_decay_steps = memory_decay_steps )
         self.rnn = RNN( self.memory, return_sequences = True, return_state = True, unroll = True )
-        self.fc1 = dense( 128, activation = gelu )
-        self.controller = dense( self.memory.controller_dim, activation = tanh )
+        self.fc1 = dense( 128, 'fc1_memory', activation = gelu )
 
     def reset(self, bs):
-        m, u, l, wp, wr, ww = self.memory.reset( bs )
-        return ( m, u, l, wp, wr, ww, tf.zeros( [ bs, self.memory.N * 2 ] ) )
+        m, u, l, wp, wr, ww, hc = self.memory.reset( bs )
+        return ( m, u, l, wp, wr, ww, hc )
         
-    def call(self, x_read, x_write, x_w, past, states, step):
+    def call(self, x_read, x_write, memory_states, step):
         
         bs = tf.shape( x_read )[0]
-        
-        # Controller
-                        
-        ## temporal encoder
-        t, presents, msks = self.transformer( x_w, past )
-                
+
         ## encoder
         h = tf.concat( [ x_read, x_write ], axis = 0 )
         h_read, h_write = tf.split( self.fc1( h ), [ bs, bs ], axis = 0 ) 
 
-        ht_read = tf.concat( [ h_read, t ], axis = -1 )
-        ht_write = tf.concat( [ h_write, t ], axis = -1 )
-
-        hc = tf.concat( [ ht_read, ht_write ], axis = 0 )
-        t_read, t_write = tf.split( self.controller( hc ), [ bs, bs ], axis = 0 )
-        
         # stack na 2 pra nao atravessar a dimensao da sequencia
-        hrnn = tf.stack( [ t_read, t_write ], axis = 2 )
+        hrnn = tf.stack( [ h_read, h_write ], axis = 2 )
         
         # Dnc
-        y, *p_state = self.rnn( hrnn, list( states ) + [ step ] )
+        y, *p_state = self.rnn( hrnn, list( memory_states ) )
 
-        out = y # + x_read[:,:,:self.output_dim]
+        out = y
 
-        return out, [ presents ] + p_state, msks
+        return out, p_state
 
 
 class ReparameterizeVAE(Layer):

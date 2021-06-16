@@ -2,16 +2,16 @@ from select import select
 import tensorflow as tf 
 import numpy as np
 import math
-import numpy as no
-from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Dense, Conv2D, Conv2DTranspose, Dropout, LayerNormalization, SimpleRNNCell, LSTMCell, GRUCell, RNN, Masking
+from tensorflow.keras.layers import Dense, Conv2D, Conv2DTranspose, Dropout, SimpleRNNCell, LSTMCell, GRUCell, RNN, BatchNormalization
 from tensorflow.keras.mixed_precision import LossScaleOptimizer
-from tensorflow.keras.activations import softmax, elu, relu, tanh
-from tensorflow.keras.initializers import he_normal, orthogonal, random_normal, truncated_normal
+from tensorflow.keras.activations import softmax, elu, relu, tanh, softplus
+from tensorflow.keras.initializers import orthogonal, random_normal, truncated_normal
+from tensorflow.keras.mixed_precision import experimental as prec
+from tensorflow.python.ops.gen_math_ops import sigmoid
 import tensorflow_probability as tfp
 from math import ceil
-from ann_utils import gather, flatten, conv1d, shape_list, Adam, gelu, RMS, nalu_transform, nalu_gru_cell, transformer_layer, ntm_plus_memory, dnc, tdnc, tdnc_v2, dense
-from cognitive_model import StateUnderstanding, StateUnderstanding_v2, GlobalMemory, FeatureCreator, Actor, Critic, FakeActor, ActorMultiEnv_v2, StateUnderstandingMultiEnv_v3, Actorv2
+from ann_utils import gather, flatten, conv1d, norm, shape_list, Adam, gelu,  nalu_transform, nalu_gru_cell, transformer_layer, dense, simple_rnn, conv2d, gru, convnalu2d, nalu, RMS, vector_quantizer
+from cognitive_model import StateUnderstanding, GlobalMemory, FeatureCreator, Actor, Critic, FakeActor, StateUnderstandingMultiEnv_v3, Actorv2
 
 from functools import partial
 
@@ -20,7 +20,7 @@ from random import randint, random
 import os
 
 #######################################################################################################################################
-# PPO Section
+# PPO Discrete Section
 #######################################################################################################################################
 
 class SimplePPONetwork(tf.Module):
@@ -47,9 +47,8 @@ class SimplePPONetwork(tf.Module):
 
         self.log_dir = 'logs/ppo_{}'.format(name)
 
-        self.lr = tf.keras.optimizers.schedules.ExponentialDecay( lr, 1000, 0.96, staircase=False, name=None )
-        self.a_optimizer = Adam( self.lr )
-        self.c_optimizer = Adam( self.lr )
+        self.a_optimizer = Adam( tf.Variable( lr ) )
+        self.c_optimizer = Adam( tf.Variable( lr ) )
 
         run_number = 0
         while os.path.exists(self.log_dir + str(run_number)):
@@ -145,9 +144,10 @@ class SimplePPONetwork(tf.Module):
 
         self.reward( tf.reduce_mean( rewards ) )
 
+
 class SimpleRNNPPONetwork(tf.Module):
 
-    def __init__(self, action_dim, name, max_len, lr, typer='s', reduce='mean', train=False):
+    def __init__(self, action_dim, name, max_len, lr, typer='s', reduce='mean', sizes=[ 512, 256, 64 ]):
         
         super(SimpleRNNPPONetwork, self).__init__()
         
@@ -155,48 +155,30 @@ class SimpleRNNPPONetwork(tf.Module):
 
         self.action_dim = action_dim
         self.typer = typer
+        self.sizes = sizes
+        self.r_sizes = sizes[1]
         
         # actor
-        if   typer == 's': self.a_fcr = SimpleRNNCell( 256, activation = tanh, name = 'a_1' )
-        elif typer == 'g': self.a_fcr =       GRUCell( 256, activation = tanh, name = 'a_2' )
-        elif typer == 'l': self.a_fcr =      LSTMCell( 256, activation = tanh, name = 'a_3' )
-        self.a_rnn = RNN( self.a_fcr, return_sequences = True, return_state = True, unroll = True )
-        
-        self.a_fc1 = dense( 512, 'a', activation = relu, kernel_initializer = orthogonal() )
-        self.a_fc2 = dense( 64, 'a', activation = relu, kernel_initializer = orthogonal() )
+        self.a_rnn = SimpleRNNPPONetwork.create_rnn( 'a', relu, self.sizes[1], typer, orthogonal(), True )
+        self.a_fc1 = dense( self.sizes[0], 'a', activation = relu, kernel_initializer = orthogonal() )
+        self.a_fc2 = dense( self.sizes[2], 'a', activation = relu, kernel_initializer = orthogonal() )
         self.act = dense( action_dim, 'a', activation = softmax )
 
         # critic
-        if   typer == 's': self.c_fcr = SimpleRNNCell( 256, activation = tanh, name = 'c_1' )
-        elif typer == 'g': self.c_fcr =       GRUCell( 256, activation = tanh, name = 'c_2' )
-        elif typer == 'l': self.c_fcr =      LSTMCell( 256, activation = tanh, name = 'c_3' )
-        self.c_rnn = RNN( self.c_fcr, return_sequences = True, return_state = True, unroll = True )
-
-        self.c_fc1 = dense( 512, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
-        self.c_fc2 = dense( 64, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_rnn = SimpleRNNPPONetwork.create_rnn( 'c', tanh, self.sizes[1], typer, tf.random_normal_initializer( stddev = 0.01 ), True )
+        self.c_fc1 = dense( self.sizes[0], 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc2 = dense( self.sizes[2], 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
         self.val = dense( 1, 'c', activation = lambda x : x )
 
-        self.log_dir = 'logs/rnn_{}_{}_ppo_{}'.format(typer, reduce, name)
-
+        # optmizer
         self.lr = tf.keras.optimizers.schedules.ExponentialDecay( lr, 1000, 0.96, staircase=False, name=None )
         self.a_optimizer = Adam( self.lr )
         self.c_optimizer = Adam( self.lr )
 
-        if   reduce == 'sum':
-            self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss, axis = 1 ) )                
-        elif reduce == 'mean':
-            self.reduce = lambda loss : tf.reduce_mean( tf.reduce_mean( loss, axis = 1 ) )
-        elif reduce == 'sum_p':
-            p = np.array( [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * max_len ) for i in range( 1, max_len + 1 ) ] )[np.newaxis,:,np.newaxis]
-            self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss * p, axis = 1 ) )
-        elif reduce == 'sum_half':
-            p = np.array( [ int( i >= max_len // 2 ) for i in range( 0, max_len ) ] )[np.newaxis,:,np.newaxis]
-            self.reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss * p, axis = 1 ) )
-        elif reduce == 'mean_half':
-            p = np.array( [ int( i >= max_len // 2 ) for i in range( 0, max_len ) ] )[np.newaxis,:,np.newaxis]
-            self.reduce = lambda loss : tf.reduce_mean( tf.reduce_mean( loss * p, axis = 1 ) )
-        elif reduce == 'sum_end':
-            self.reduce_done = lambda loss, terminal : tf.reduce_mean( tf.reduce_sum( loss * terminal, axis = 1 ) )
+        self.reduce = SimpleRNNPPONetwork.sequence_reduce( reduce, max_len )
+
+        # logs
+        self.log_dir = 'logs/rnn_{}_{}_ppo_{}'.format(typer, reduce, name)
 
         run_number = 0
         while os.path.exists(self.log_dir + str(run_number)): run_number += 1
@@ -206,17 +188,49 @@ class SimpleRNNPPONetwork(tf.Module):
         self.a_loss = tf.keras.metrics.Mean( 'a_loss', dtype = tf.float32 )
         self.c_loss = tf.keras.metrics.Mean( 'c_loss', dtype = tf.float32 )
         self.reward = tf.keras.metrics.Mean( 'reward', dtype = tf.float32 )
+    
+    @staticmethod
+    def create_rnn(name, activation, size, typer, kernel_initializer, normalize):
+
+        if   typer == 's': fcr = simple_rnn( size, activation = activation, name = name, kernel_initializer = kernel_initializer, norm_h = normalize )
+        elif typer == 'g': fcr =        gru( size, activation = activation, name = name, kernel_initializer = kernel_initializer, norm_h = normalize )
+        elif typer == 'l': fcr =   LSTMCell( size, activation = activation, name = name, kernel_initializer = kernel_initializer )
+
+        rnn = RNN( fcr, return_sequences = True, return_state = True, unroll = True )
+
+        return rnn
+
+    @staticmethod
+    def sequence_reduce(mode, max_len):
+        
+        if   mode == 'sum':
+            reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss, axis = 1 ) )                
+        elif mode == 'mean':
+            reduce = lambda loss : tf.reduce_mean( tf.reduce_mean( loss, axis = 1 ) )
+        elif mode == 'sum_p':
+            p = np.array( [ ( 2 * ( i - 1 ) + 1 ) / ( 2 * max_len ) for i in range( 1, max_len + 1 ) ] )[np.newaxis,:,np.newaxis]
+            reduce = lambda loss : tf.reduce_mean( tf.reduce_sum( loss * p, axis = 1 ) )
+        elif mode == 'sum_half':
+            p = np.array( [ int( i >= max_len // 2 ) for i in range( 0, max_len ) ] )[np.newaxis,:,np.newaxis]
+            reduce = lambda loss, msk : tf.reduce_mean( tf.reduce_sum( loss * msk * tf.cast( p, tf.float32 ), axis = 1 ) )
+        elif mode == 'mean_half':
+            p = np.array( [ int( i >= max_len // 2 ) for i in range( 0, max_len ) ] )[np.newaxis,:,np.newaxis]
+            reduce = lambda loss, msk : tf.reduce_mean( tf.reduce_mean( loss * msk * tf.cast( p, tf.float32 ), axis = 1 ) )
+        elif mode == 'sum_end':
+            reduce = lambda loss, terminal : tf.reduce_mean( tf.reduce_sum( loss * terminal, axis = 1 ) )
+
+        return reduce
 
     def random_states(self, bs):
 
-        shape = [ bs, 256 ]
+        shape = [ bs, self.sizes[1] ]
         if self.typer == 's': return tf.random.normal( shape )
         if self.typer == 'g': return tf.random.normal( shape )
         if self.typer == 'l': return ( tf.random.normal( shape ), tf.random.normal( shape ) )
 
     def zero_states(self, bs):
 
-        shape = [ bs, 256 ]
+        shape = [ bs, self.sizes[1] ]
         if self.typer == 's': return tf.zeros( shape )
         if self.typer == 'g': return tf.zeros( shape )
         if self.typer == 'l': return ( tf.zeros( shape ), tf.zeros( shape ) )
@@ -233,7 +247,7 @@ class SimpleRNNPPONetwork(tf.Module):
     def value(self, states, p_state):
 
         x = self.c_fc1( states )
-        x, *h = self.c_rnn( x, initial_state = p_state, training = True )
+        x, h = self.c_rnn( x, initial_state = p_state, training = True )
         x = self.c_fc2( x )
         values = self.val( x )
 
@@ -244,9 +258,7 @@ class SimpleRNNPPONetwork(tf.Module):
         self.probs( states, a_p_state )
         self.value( states, c_p_state )
 
-    def ppo_loss(self, advantages, prediction_picks, actions, y_pred):
-        
-        # Defined in https://arxiv.org/abs/1707.06347
+    def ppo_loss(self, advantages, prediction_picks, actions, y_pred, masks):
         
         LOSS_CLIPPING = 0.2
         ENTROPY_LOSS = 0.001
@@ -262,46 +274,44 @@ class SimpleRNNPPONetwork(tf.Module):
         p1 = ratio * advantages
         p2 = tf.clip_by_value( ratio, 1 - LOSS_CLIPPING, 1 + LOSS_CLIPPING ) * advantages
 
-        actor_loss = -self.reduce( tf.minimum( p1, p2 ) )
+        actor_loss = -self.reduce( tf.minimum( p1, p2 ), masks )
 
-        entropy = -( y_pred * tf.math.log( y_pred + 1e-10 ) )
+        entropy = ( y_pred * tf.math.log( y_pred + 1e-10 ) )
         entropy = ENTROPY_LOSS * tf.reduce_mean( entropy )
         
         total_loss = actor_loss - entropy
 
         return total_loss
 
-    def critic_PPO2_loss(self, values, y_true, y_pred):
+    def critic_PPO2_loss(self, values, y_true, y_pred, masks):
         
         LOSS_CLIPPING = 0.2
         clipped_value_loss = values + tf.clip_by_value( y_pred - values, -LOSS_CLIPPING, LOSS_CLIPPING )
         v_loss1 = ( y_true - clipped_value_loss ) ** 2
         v_loss2 = ( y_true - y_pred ) ** 2
         
-        value_loss = 0.5 * self.reduce( tf.maximum( v_loss1, v_loss2 ) )
+        value_loss = 0.5 * self.reduce( tf.maximum( v_loss1, v_loss2 ), masks )
 
         return value_loss
 
-    def train(self, states, values, target, advantages, predictions, actions, rewards, epochs):
+    def train(self, states, values, target, advantages, predictions, actions, rewards, masks, epochs):
 
-        a_vars = [ v for v in self.trainable_variables if 'a_' in v.name ]
-        c_vars = [ v for v in self.trainable_variables if 'c_' in v.name ]
+        a_vars = [ v for v in self.trainable_variables if 'a_' in v.name or 'a/' in v.name ]
+        c_vars = [ v for v in self.trainable_variables if 'c_' in v.name or 'c/' in v.name ]
 
         bs = tf.shape( states )[0]
         for e in range( epochs ):
 
             with tf.GradientTape() as tape_c:
                 c_pred, _ = self.value( states, self.zero_states(bs) )
-                c_loss = self.critic_PPO2_loss( values, target, c_pred )
-            # c_gradients, _ = tf.clip_by_global_norm( tape_c.gradient( c_loss, c_vars ), 0.02 )
+                c_loss = self.critic_PPO2_loss( values, target, c_pred, masks )
             c_gradients = tape_c.gradient( c_loss, c_vars )
             self.c_optimizer.apply_gradients( zip( c_gradients, c_vars ) )
             self.c_loss( c_loss )
 
             with tf.GradientTape() as tape_a:
                 a_pred, _ = self.probs( states, self.zero_states(bs) )
-                a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
-            # a_gradients, _ = tf.clip_by_global_norm( tape_a.gradient( a_loss, a_vars ), 0.02 )
+                a_loss = self.ppo_loss( advantages, predictions, actions, a_pred, masks )
             a_gradients = tape_a.gradient( a_loss, a_vars )
             self.a_optimizer.apply_gradients( zip( a_gradients, a_vars ) )
             self.a_loss( a_loss )
@@ -333,9 +343,8 @@ class NaluPPONetwork(tf.Module):
 
         self.log_dir = 'logs/nalu_ppo_{}'.format(name)
 
-        self.lr = tf.keras.optimizers.schedules.ExponentialDecay( lr, 1000, 0.96, staircase=False, name=None )
-        self.a_optimizer = Adam( self.lr )
-        self.c_optimizer = Adam( self.lr )
+        self.a_optimizer = Adam( tf.Variable( lr ) )
+        self.c_optimizer = Adam( tf.Variable( lr ) )
 
         run_number = 0
         while os.path.exists(self.log_dir + str(run_number)):
@@ -751,8 +760,7 @@ class IQNNaluPPONetwork(tf.Module):
         self.c_optimizer = Adam( self.lr )
 
         run_number = 0
-        while os.path.exists(self.log_dir + str(run_number)):
-            run_number += 1
+        while os.path.exists(self.log_dir + str(run_number)): run_number += 1
         self.log_dir = self.log_dir + str(run_number)
         self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
         
@@ -809,8 +817,6 @@ class IQNNaluPPONetwork(tf.Module):
         return probs, xa, values, tau
 
     def ppo_loss(self, advantages, prediction_picks, actions, y_pred):
-        
-        # Defined in https://arxiv.org/abs/1707.06347
         
         LOSS_CLIPPING = 0.2
         ENTROPY_LOSS = 0.001
@@ -893,6 +899,424 @@ class IQNNaluPPONetwork(tf.Module):
             self.c_loss( c_loss )
             self.a_loss( a_loss )
         
+        self.reward( tf.reduce_mean( rewards ) )
+
+
+#######################################################################################################################################
+# PPO Discrete Section - Vision
+#######################################################################################################################################
+
+class SimpleConvPPONetwork(tf.Module):
+
+    def __init__(self, action_dim, name, lr, train=False):
+        
+        super(SimpleConvPPONetwork, self).__init__()
+        
+        self.module_type = 'ConvPPO'
+
+        self.action_dim = action_dim
+        
+        # base
+        self.su = StateUnderstanding()
+
+        # memory
+        self.gm = GlobalMemory( action_dim, 512, 32, 128, 32, 4 )
+
+        # dreamer
+        self.encode_future = dense( 512, 'b_' )
+
+        ## Next State
+        self.encode_state = dense( 1024, 'b_' )
+        self.dmem0 = Conv2DTranspose( 128, 5, 4, name = 'dmem0', activation = relu, padding = 'same' )
+        self.dmem1 = Conv2DTranspose( 64,  3, 2, name = 'dmem1', activation = relu, padding = 'same' )
+        self.dmem2 = Conv2DTranspose( 64,  3, 2, name = 'dmem2', activation = relu, padding = 'same' )
+        self.dmem3 = Conv2DTranspose( 32,  3, 2, name = 'dmem3', activation = softmax, padding = 'same' )
+
+        ## Reward 
+        self.r_fc1 = dense( 64, 'rw', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.rw = dense( 1, 'rw', activation = lambda x : x )
+
+        # actor
+        self.a_fc1i = dense( 512, 'ac', activation = tanh, kernel_initializer = orthogonal() )
+        self.a_fc1v = dense( 512, 'ac', activation = tanh, kernel_initializer = orthogonal() )
+        self.a_fc2 = dense( 256, 'ac', activation = relu, kernel_initializer = orthogonal() )
+        self.a_fc3 = dense( 64, 'ac', activation = relu, kernel_initializer = orthogonal() )
+        self.act = dense( action_dim, 'ac', activation = softmax )
+
+        # critic
+        self.c_fc1i = dense( 512, 'cr', activation = tanh, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc1v = dense( 512, 'cr', activation = tanh, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc2 = dense( 256, 'cr', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc3 = dense( 64, 'cr', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.val = dense( 1, 'cr', activation = lambda x : x )
+
+        self.log_dir = 'logs/conv_ppo_{}'.format(name)
+
+        self.lr = tf.keras.optimizers.schedules.ExponentialDecay( lr, 1000, 0.96, staircase=False, name=None )
+        self.b_optimizer = Adam( self.lr )
+        self.g_optimizer = RMS( tf.Variable( 2e-5 ) )
+        self.a_optimizer = Adam( self.lr )
+        self.c_optimizer = Adam( self.lr )
+
+        run_number = 0
+        while os.path.exists(self.log_dir + str(run_number)):
+            run_number += 1
+        self.log_dir = self.log_dir + str(run_number)
+        self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
+        
+        self.a_loss = tf.keras.metrics.Mean( 'a_loss', dtype = tf.float32 )
+        self.c_loss = tf.keras.metrics.Mean( 'c_loss', dtype = tf.float32 )
+        self.b_loss_kl = tf.keras.metrics.Mean( 'b_loss_kl', dtype = tf.float32 )
+        self.b_loss_rec = tf.keras.metrics.Mean( 'b_loss_rec', dtype = tf.float32 )
+        self.g_loss_rec_next = tf.keras.metrics.Mean( 'g_loss_rec_next', dtype = tf.float32 )
+        self.g_loss_rec_next_val = tf.keras.metrics.Mean( 'g_loss_rec_next_val', dtype = tf.float32 )
+        self.b_perplexity = tf.keras.metrics.Mean( 'b_perplexity', dtype = tf.float32 )
+        self.reward = tf.keras.metrics.Mean( 'reward', dtype = tf.float32 )
+        self.m_acc = tf.keras.metrics.Accuracy( 'm_acc', dtype = tf.float32 )
+
+        self.b_loss_rec( 1 )
+
+    def encode_next_state(self, state, memory, a):
+
+        bs, ss, *_ = state.shape.as_list()
+        
+        #
+        x = self.encode_future( tf.concat( [ state, memory, a ], axis = -1 ) )
+
+        #
+        xs = self.encode_state( x )
+        xs = tf.reshape( xs, [ bs * ss, -1 ] )
+        xs = tf.expand_dims( tf.expand_dims( xs, axis = -2 ), axis = -2 )
+        xs = self.dmem0( xs )
+        xs = self.dmem1( xs )
+        xs = self.dmem2( xs )
+        xs = self.dmem3( xs )
+        xs = tf.reshape( xs, [ bs, ss ] + self.su.index_shape )
+
+        #
+        xr = self.r_fc1( x )
+        values = self.rw( xr )
+        
+        return xs, values
+
+    def probs(self, states_i, states_v, eval=True):
+
+        vq = self.su.encode( states_i, eval )
+        e = tf.cast( flatten( vq['encoding_indices'] ), tf.float32 )
+        xi = self.a_fc1i( tf.stop_gradient( e ) )
+        xv = self.a_fc1v( states_v )
+        x = self.a_fc2( xi + xv )
+        x = self.a_fc3( x )
+        probs = self.act( x )
+
+        return probs
+
+    def value(self, states_i, states_v, eval=True):
+
+        vq = self.su.encode( states_i, eval )
+        e = tf.cast( flatten( vq['encoding_indices'] ), tf.float32 )
+        xi = self.c_fc1i( tf.stop_gradient( e ) )
+        xv = self.c_fc1v( states_v )
+        x = self.c_fc2( xi + xv )
+        x = self.c_fc3( x )
+        values = self.val( x )
+
+        return values
+
+    def __call__(self, states_i, p_states_i, states_v, ac, rw, dx):
+        
+        vq, _ = self.su( states_i )
+        p_vq, _ = self.su( p_states_i )
+        su = tf.cast( tf.expand_dims( flatten( vq['encoding_indices'] ), axis = 1 ), tf.float32 )
+        p_su = tf.cast( tf.expand_dims( flatten( p_vq['encoding_indices'] ), axis = 1 ), tf.float32 )
+        gm, _, ae = self.gm( su, p_su, ac, rw, dx, 0, self.gm.reset(1) )
+        self.encode_next_state( su, gm, ae )
+        self.probs( states_i, states_v )
+        self.value( states_i, states_v )
+
+    def ppo_loss(self, advantages, prediction_picks, actions, y_pred):
+        
+        LOSS_CLIPPING = 0.2
+        ENTROPY_LOSS = 0.001
+        
+        prob = actions * y_pred
+        old_prob = actions * prediction_picks
+
+        prob = tf.clip_by_value( prob, 1e-10, 1.0 )
+        old_prob = tf.cast( tf.clip_by_value( old_prob, 1e-10, 1.0 ), tf.float32 )
+
+        ratio = tf.math.exp( tf.math.log( prob ) - tf.math.log( old_prob ) )
+        
+        p1 = ratio * advantages
+        p2 = tf.clip_by_value( ratio, 1 - LOSS_CLIPPING, 1 + LOSS_CLIPPING ) * advantages
+
+        actor_loss = -tf.reduce_mean( tf.minimum( p1, p2 ) )
+
+        entropy = -( y_pred * tf.math.log( y_pred + 1e-10 ) )
+        entropy = ENTROPY_LOSS * tf.reduce_mean( entropy )
+        
+        total_loss = actor_loss + entropy
+
+        return total_loss
+
+    def critic_PPO2_loss(self, values, y_true, y_pred):
+        
+        LOSS_CLIPPING = 0.2
+        clipped_value_loss = values + tf.clip_by_value( y_pred - values, -LOSS_CLIPPING, LOSS_CLIPPING )
+        v_loss1 = ( y_true - clipped_value_loss ) ** 2
+        v_loss2 = ( y_true - y_pred ) ** 2
+        
+        value_loss = 0.5 * tf.reduce_mean( tf.maximum( v_loss1, v_loss2 ) )
+        return value_loss
+
+    def train_rl(self, states_i, states_v, values, target, advantages, predictions, actions, rewards, epochs):
+
+        a_vars = [ v for v in self.trainable_variables if 'ac_' in v.name ]
+        c_vars = [ v for v in self.trainable_variables if 'cr_' in v.name ]
+
+        for e in range( epochs ):
+           
+            with tf.GradientTape() as tape_c:
+                c_pred = self.value( states_i, states_v )
+                c_loss = self.critic_PPO2_loss( values, target, c_pred )
+            c_gradients = tape_c.gradient( c_loss, c_vars )
+            self.c_optimizer.apply_gradients( zip( c_gradients, c_vars ) )
+            self.c_loss( c_loss )
+
+            with tf.GradientTape() as tape_a:
+                a_pred = self.probs( states_i, states_v )
+                a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
+            a_gradients = tape_a.gradient( a_loss, a_vars )
+            self.a_optimizer.apply_gradients( zip( a_gradients, a_vars ) )
+            self.a_loss( a_loss )
+
+        self.reward( tf.reduce_mean( rewards ) )
+        
+    def train_vae(self, states_i):
+
+        b_vars = self.su.variables
+
+        with tf.GradientTape() as tape_b:
+            vq, dec = self.su( states_i, eval = False )
+            b_loss = vq['rec_loss'] + vq['loss']
+        
+        b_gradients = tape_b.gradient( b_loss, b_vars )
+        self.b_optimizer.apply_gradients( zip( b_gradients, b_vars ) )
+        
+        self.b_loss_kl( vq['loss'] )
+        self.b_loss_rec( vq['rec_loss'] )
+        self.b_perplexity( vq['perplexity'] )
+        
+        return dec, states_i, tf.gather( self.su.colors, vq['encoding_indices'] )
+
+    def train_memory(self, states_i, p_states_i, n_states_i, ac, p_ac, rw, prw, dx, bs):
+
+        g_vars = self.gm.variables + self.encode_future.trainable_variables + self.encode_state.trainable_variables + self.dmem0.trainable_variables + self.dmem1.trainable_variables + self.dmem2.trainable_variables + self.dmem3.trainable_variables + self.r_fc1.trainable_variables + self.rw.trainable_variables
+        ce = tf.keras.losses.SparseCategoricalCrossentropy( from_logits = False )
+        mse = tf.keras.losses.MeanSquaredError()
+
+        bs, ss, *_ = states_i.shape.as_list()
+        
+        t_bound = 2
+        p = np.array( [ int( i >= t_bound ) for i in range( 0, ss ) ] )[np.newaxis,:,np.newaxis,np.newaxis,np.newaxis]
+        with tf.GradientTape() as tape_g:
+            
+            f_states = tf.reshape( states_i, [ bs * ss, 128, 128, 3 ] )
+            f_p_states = tf.reshape( p_states_i, [ bs * ss, 128, 128, 3 ] )
+            f_n_states = tf.reshape( n_states_i, [ bs * ss, 128, 128, 3 ] )
+
+            pa = tf.argmax( p_ac, axis = -1 )
+            a = tf.argmax( ac, axis = -1 )
+
+            vq = self.su.encode( f_states, eval = False )
+            p_vq = self.su.encode( f_p_states, eval = False )
+            n_vq = self.su.encode( f_n_states, eval = False )
+
+            su = tf.stop_gradient( tf.cast( tf.reshape( flatten( vq['encoding_indices'] ), [ bs, ss, -1 ] ), tf.float32 ) )
+            p_su = tf.stop_gradient( tf.cast( tf.reshape( flatten( p_vq['encoding_indices'] ), [ bs, ss, -1 ] ), tf.float32 ) )
+            n_su = tf.stop_gradient( tf.reshape( n_vq['encoding_indices'], [ bs, ss, 32, 32 ] ) )
+            
+            gm , _, _ = self.gm( su, p_su, pa, prw, dx, 0, self.gm.reset(bs) )
+            dec_next_index, pred_values = self.encode_next_state( su, gm, self.gm.get_ac_emb( a ) )
+            loss1 = ce( n_su, dec_next_index, p )
+            loss2 = mse( tf.expand_dims( rw, -1 ), pred_values, p )
+
+            loss = loss1 + loss2
+
+            di = tf.argmax( dec_next_index, -1 )
+
+        g_gradients = tape_g.gradient( loss, g_vars )
+        self.g_optimizer.apply_gradients( zip( g_gradients, g_vars ) )
+        
+        self.g_loss_rec_next( loss1 )
+        self.g_loss_rec_next_val( loss2 )
+        self.m_acc.update_state( n_su, di )
+
+        qp = self.su.e_vq.get_vq( di )        
+        qp = tf.reshape( qp, [ bs * ss, 32, 32, 32 ] )
+
+        next_state_p = self.su.decode( qp, eval = False )
+        next_state_t = self.su.decode( n_vq['quantize'], eval = False )
+
+        images = tf.squeeze( tf.concat( tf.split( tf.reshape( states_i, [ bs, ss, 128, 128, 3 ] ), num_or_size_splits = ss, axis = 1 ), axis = 3 ), axis = 1 )
+        n_images = tf.squeeze( tf.concat( tf.split( tf.reshape( n_states_i, [ bs, ss, 128, 128, 3 ] ), num_or_size_splits = ss, axis = 1 ), axis = 3 ), axis = 1 )
+        
+        p_index = tf.squeeze( tf.concat( tf.split( tf.reshape( di, [ bs, ss, 32, 32 ] ), num_or_size_splits = ss, axis = 1 )[10:], axis = 3 ), axis = 1 )
+        t_index = tf.squeeze( tf.concat( tf.split( tf.reshape( n_su, [ bs, ss, 32, 32 ] ), num_or_size_splits = ss, axis = 1 )[10:], axis = 3 ), axis = 1 )
+        
+
+        next_state_p = tf.squeeze( tf.concat( tf.split( tf.reshape( next_state_p, [ bs, ss, 128, 128, 3 ] ), num_or_size_splits = ss, axis = 1 ), axis = 3 ), axis = 1 )
+        next_state_t = tf.squeeze( tf.concat( tf.split( tf.reshape( next_state_t, [ bs, ss, 128, 128, 3 ] ), num_or_size_splits = ss, axis = 1 ), axis = 3 ), axis = 1 )
+        
+        return ( images, n_images, tf.gather( self.su.colors, p_index ), tf.gather( self.su.colors, t_index ), next_state_p, next_state_t )
+
+
+#######################################################################################################################################
+# PPO Continuous Section
+#######################################################################################################################################
+
+class SimpleCPPONetwork(tf.Module):
+
+    def __init__(self, action_dim, name, lr, action_bound, std_bound, train=False):
+        
+        super(SimpleCPPONetwork, self).__init__()
+        
+        self.module_type = 'CPPO'
+
+        self.action_dim = action_dim
+        self.action_bound = action_bound
+        self.std_bound = std_bound
+        
+        # actor
+        self.a_fc1 = dense( 512, 'a', activation = relu, kernel_initializer = orthogonal() )
+        self.a_fc2 = dense( 256, 'a', activation = relu, kernel_initializer = orthogonal() )
+        self.a_fc3 = dense( 64, 'a', activation = relu, kernel_initializer = orthogonal() )
+        self.mu = dense( action_dim, 'a', activation = softmax )
+        self.std = dense( action_dim, 'a', activation = softplus )
+
+        # critic
+        self.c_fc1 = dense( 512, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc2 = dense( 256, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.c_fc3 = dense( 64, 'c', activation = relu, kernel_initializer = tf.random_normal_initializer( stddev = 0.01 ) )
+        self.val = dense( 1, 'c', activation = lambda x : x )
+
+        self.log_dir = 'logs/cppo_{}'.format(name)
+
+        self.lr = tf.keras.optimizers.schedules.ExponentialDecay( lr, 1000, 0.96, staircase=False, name=None )
+        self.a_optimizer = Adam( self.lr )
+        self.c_optimizer = Adam( self.lr )
+
+        run_number = 0
+        while os.path.exists(self.log_dir + str(run_number)):
+            run_number += 1
+        self.log_dir = self.log_dir + str(run_number)
+        self.train_summary_writer = tf.summary.create_file_writer(self.log_dir)
+        
+        self.a_loss = tf.keras.metrics.Mean( 'a_loss', dtype = tf.float32 )
+        self.c_loss = tf.keras.metrics.Mean( 'c_loss', dtype = tf.float32 )
+        self.reward = tf.keras.metrics.Mean( 'reward', dtype = tf.float32 )
+
+    def probs(self, states):
+
+        x = self.a_fc1( states )
+        x = self.a_fc2( x )
+        x = self.a_fc3( x )
+
+        mu = self.mu( x ) * self.action_bound
+        std = self.std( x )
+
+        return mu, std
+
+    def log_pdf(self, mu, std, action):
+
+        std = tf.clip_by_value( std, self.std_bound[0], self.std_bound[1] )
+        var = std ** 2
+        log_policy_pdf = -0.5 * (action - mu) ** 2 / var - 0.5 * tf.math.log(var * 2 * np.pi)
+
+        return tf.reduce_sum( log_policy_pdf, 1, keepdims = True )
+
+    def get_action(self, states):
+
+        mu, std = self.probs( states )
+        action = tf.random.normal( mean = mu, stddev = std, shape = [ tf.shape( states )[0], self.action_dim ] )
+        action = tf.clip_by_value( action, -self.action_bound, self.action_bound )
+        log_policy = self.log_pdf( mu, std, action )
+
+        return log_policy, action
+
+    def value(self, states):
+
+        x = self.c_fc1( states )
+        x = self.c_fc2( x )
+        x = self.c_fc3( x )
+        values = self.val( x )
+
+        return values
+
+    def __call__(self, states):
+
+        self.probs( states )
+        self.value( states )
+
+    def ppo_loss(self, advantages, prediction_picks, actions, y_pred):
+        
+        # Defined in https://arxiv.org/abs/1707.06347
+        
+        LOSS_CLIPPING = 0.2
+        ENTROPY_LOSS = 0.001
+        
+        prob = actions * y_pred
+        old_prob = actions * prediction_picks
+
+        prob = tf.clip_by_value( prob, 1e-10, 1.0 )
+        old_prob = tf.cast( tf.clip_by_value( old_prob, 1e-10, 1.0 ), tf.float32 )
+
+        ratio = tf.math.exp( tf.math.log( prob ) - tf.math.log( old_prob ) )
+        
+        p1 = ratio * advantages
+        p2 = tf.clip_by_value( ratio, 1 - LOSS_CLIPPING, 1 + LOSS_CLIPPING ) * advantages
+
+        actor_loss = -tf.reduce_mean( tf.minimum( p1, p2 ) )
+
+        entropy = -( y_pred * tf.math.log( y_pred + 1e-10 ) )
+        entropy = ENTROPY_LOSS * tf.reduce_mean( entropy )
+        
+        total_loss = actor_loss - entropy
+
+        return total_loss
+
+    def critic_PPO2_loss(self, values, y_true, y_pred):
+        
+        LOSS_CLIPPING = 0.2
+        clipped_value_loss = values + tf.clip_by_value( y_pred - values, -LOSS_CLIPPING, LOSS_CLIPPING )
+        v_loss1 = ( y_true - clipped_value_loss ) ** 2
+        v_loss2 = ( y_true - y_pred ) ** 2
+        
+        value_loss = 0.5 * tf.reduce_mean( tf.maximum( v_loss1, v_loss2 ) )
+        #value_loss = K.mean((y_true - y_pred) ** 2) # standard PPO loss
+        return value_loss
+
+    def train(self, states, values, target, advantages, predictions, actions, rewards, epochs):
+
+        a_vars = [ v for v in self.trainable_variables if 'a_' in v.name ]
+        c_vars = [ v for v in self.trainable_variables if 'c_' in v.name ]
+
+        for e in range( epochs ):
+
+            with tf.GradientTape() as tape_c:
+                c_pred = self.value( states )
+                c_loss = self.critic_PPO2_loss( values, target, c_pred )
+            c_gradients = tape_c.gradient( c_loss, c_vars )
+            self.c_optimizer.apply_gradients( zip( c_gradients, c_vars ) )
+            self.c_loss( c_loss )
+
+            with tf.GradientTape() as tape_a:
+                a_pred = self.probs( states )
+                a_loss = self.ppo_loss( advantages, predictions, actions, a_pred )
+            a_gradients = tape_a.gradient( a_loss, a_vars )
+            self.a_optimizer.apply_gradients( zip( a_gradients, a_vars ) )
+            self.a_loss( a_loss )
+
         self.reward( tf.reduce_mean( rewards ) )
 
 
